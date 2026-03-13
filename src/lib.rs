@@ -51,6 +51,7 @@ const SENSE_KEY_DATA_PROTECT: u8 = 0x07;
 const ASC_INVALID_OPCODE: u8 = 0x20;
 const ASC_INVALID_FIELD_IN_CDB: u8 = 0x24;
 const ASCQ_NONE: u8 = 0x00;
+const ASC_READ_ERROR: u8 = 0x11;
 const ASC_LBA_OUT_OF_RANGE: u8 = 0x21;
 const ASC_WRITE_PROTECTED: u8 = 0x27;
 const ASC_WRITE_ERROR: u8 = 0x0c;
@@ -366,8 +367,8 @@ impl<D: BlockDevice> TcmuDevice<D> {
             return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, ASCQ_NONE);
         }
         match self.device.read_at(offset, byte_len as usize) {
-            Ok(bytes) => good(bytes.as_ref().to_vec()),
-            Err(_) => check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, ASCQ_NONE),
+            Ok(bytes) if bytes.as_ref().len() == byte_len as usize => good(bytes.as_ref().to_vec()),
+            Ok(_) | Err(_) => check_condition(SENSE_KEY_MEDIUM_ERROR, ASC_READ_ERROR, ASCQ_NONE),
         }
     }
 
@@ -586,6 +587,62 @@ mod tests {
         // is_read_only() defaults to true
     }
 
+    struct ShortReadDevice {
+        size: u64,
+        id: [u8; 4],
+    }
+
+    impl ShortReadDevice {
+        fn new(size_blocks: usize) -> Self {
+            Self {
+                size: (size_blocks * LOGICAL_BLOCK_SIZE as usize) as u64,
+                id: (size_blocks as u32).to_be_bytes(),
+            }
+        }
+    }
+
+    impl BlockDevice for ShortReadDevice {
+        fn size_bytes(&self) -> u64 {
+            self.size
+        }
+
+        fn read_at(&self, _offset: u64, len: usize) -> anyhow::Result<impl AsRef<[u8]>> {
+            Ok(vec![0xAB; len.saturating_sub(1)])
+        }
+
+        fn id_bytes(&self) -> Vec<u8> {
+            self.id.to_vec()
+        }
+    }
+
+    struct ErrorReadDevice {
+        size: u64,
+        id: [u8; 4],
+    }
+
+    impl ErrorReadDevice {
+        fn new(size_blocks: usize) -> Self {
+            Self {
+                size: (size_blocks * LOGICAL_BLOCK_SIZE as usize) as u64,
+                id: (size_blocks as u32).to_be_bytes(),
+            }
+        }
+    }
+
+    impl BlockDevice for ErrorReadDevice {
+        fn size_bytes(&self) -> u64 {
+            self.size
+        }
+
+        fn read_at(&self, _offset: u64, _len: usize) -> anyhow::Result<impl AsRef<[u8]>> {
+            Err::<Vec<u8>, _>(anyhow::anyhow!("backend read failed"))
+        }
+
+        fn id_bytes(&self) -> Vec<u8> {
+            self.id.to_vec()
+        }
+    }
+
     // ── Read-write device ─────────────────────────────────────────────────────
 
     struct RwDevice {
@@ -648,6 +705,14 @@ mod tests {
 
     fn rw_device(size_blocks: usize) -> TcmuDevice<RwDevice> {
         TcmuDevice::new(RwDevice::new(size_blocks), ro_config())
+    }
+
+    fn short_read_device(size_blocks: usize) -> TcmuDevice<ShortReadDevice> {
+        TcmuDevice::new(ShortReadDevice::new(size_blocks), ro_config())
+    }
+
+    fn error_read_device(size_blocks: usize) -> TcmuDevice<ErrorReadDevice> {
+        TcmuDevice::new(ErrorReadDevice::new(size_blocks), ro_config())
     }
 
     // ── Read-only tests ───────────────────────────────────────────────────────
@@ -713,6 +778,32 @@ mod tests {
         assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
         assert_eq!(resp.sense[2], SENSE_KEY_ILLEGAL_REQUEST);
         assert_eq!(resp.sense[12], ASC_LBA_OUT_OF_RANGE);
+    }
+
+    #[test]
+    fn backend_read_error_returns_medium_error() {
+        let dev = error_read_device(2);
+        let mut cdb = [0_u8; 10];
+        cdb[0] = READ_10;
+        put_be_u32(&mut cdb[2..6], 0);
+        put_be_u16(&mut cdb[7..9], 1);
+        let resp = dev.execute(&cdb, &[]);
+        assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
+        assert_eq!(resp.sense[2], SENSE_KEY_MEDIUM_ERROR);
+        assert_eq!(resp.sense[12], ASC_READ_ERROR);
+    }
+
+    #[test]
+    fn short_read_returns_medium_error() {
+        let dev = short_read_device(2);
+        let mut cdb = [0_u8; 10];
+        cdb[0] = READ_10;
+        put_be_u32(&mut cdb[2..6], 0);
+        put_be_u16(&mut cdb[7..9], 1);
+        let resp = dev.execute(&cdb, &[]);
+        assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
+        assert_eq!(resp.sense[2], SENSE_KEY_MEDIUM_ERROR);
+        assert_eq!(resp.sense[12], ASC_READ_ERROR);
     }
 
     // ── Read-write tests ──────────────────────────────────────────────────────
