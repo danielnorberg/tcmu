@@ -138,3 +138,25 @@ See the [`examples/`](examples/) directory:
   ```sh
   sudo cargo run --example loopback --features linux-target -- /tmp/ext4.img
   ```
+
+## Benchmarks
+
+The crate includes a Criterion benchmark that measures file-read performance
+through a TCMU loopback block device and compares it with a normal read-only
+loop mount of the same ext4 image.
+
+It benchmarks two workloads:
+
+- Reading a 4 GiB large file (`large_file/{tcmu,loop}`)
+- Reading many small files (`small_files/{tcmu,loop}`)
+
+Run it on Linux as root with the `linux-target` feature enabled:
+
+```sh
+sudo cargo bench --features linux-target --bench file_read -- --noplot
+```
+
+The benchmark prepares one ext4 image, populates it once, keeps the backing
+image warm in the host cache, and then measures single-pass read throughput by
+mounting each transport read-only, reading the workload once, and unmounting
+before the next sample.

@@ -439,6 +439,20 @@ const IOV_BASE: usize = 0;
 const IOV_LEN: usize = 8;
 const IOV_STRIDE: usize = 16;
 
+fn command_has_data_out(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        crate::MODE_SELECT_6
+            | crate::MODE_SELECT_10
+            | crate::WRITE_6
+            | crate::WRITE_10
+            | crate::WRITE_12
+            | crate::WRITE_16
+            | crate::WRITE_SAME_10
+            | crate::WRITE_SAME_16
+    )
+}
+
 #[inline]
 unsafe fn ru32(base: *const u8, off: usize) -> u32 {
     unsafe { (base.add(off) as *const u32).read_unaligned() }
@@ -596,17 +610,24 @@ fn run_event_loop<D: BlockDevice>(
             let cdb_off = unsafe { ru64(entry, ENTRY_CDB_OFF) } as usize;
             let cdb = unsafe { std::slice::from_raw_parts(base.add(cdb_off), 16) };
 
-            // For write commands the IOVs carry initiator data; gather it
-            // so execute() can inspect it.
+            // Only DATA OUT commands carry initiator payload in their IOVs.
+            // Reads use the same IOV array for response buffers; copying those
+            // pages into a temporary Vec just burns memory bandwidth.
             let iov_arr = unsafe { entry.add(ENTRY_IOVS) };
-            let mut data_out = Vec::new();
-            for i in 0..iov_cnt {
-                let iov = unsafe { iov_arr.add(i * IOV_STRIDE) };
-                let off = unsafe { ru64(iov, IOV_BASE) } as usize;
-                let len = unsafe { ru64(iov, IOV_LEN) } as usize;
+            let data_out = if command_has_data_out(cdb[0]) {
+                let mut data_out = Vec::new();
+                for i in 0..iov_cnt {
+                    let iov = unsafe { iov_arr.add(i * IOV_STRIDE) };
+                    let off = unsafe { ru64(iov, IOV_BASE) } as usize;
+                    let len = unsafe { ru64(iov, IOV_LEN) } as usize;
+                    data_out.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(base.add(off), len)
+                    });
+                }
                 data_out
-                    .extend_from_slice(unsafe { std::slice::from_raw_parts(base.add(off), len) });
-            }
+            } else {
+                Vec::new()
+            };
 
             let response = device.execute(cdb, &data_out);
 

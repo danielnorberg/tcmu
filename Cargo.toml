@@ -16,5 +16,11 @@ anyhow = "1.0"
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
+criterion = "0.5"
 libc = "0.2"
 tempfile = "3"
+
+[[bench]]
+name = "file_read"
+harness = false
+required-features = ["linux-target"]
