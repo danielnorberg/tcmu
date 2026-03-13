@@ -446,6 +446,13 @@ impl<D: BlockDevice> TcmuDevice<D> {
         if cdb.len() < 10 {
             return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
         }
+        if cdb[1] != 0 {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_INVALID_FIELD_IN_CDB,
+                ASCQ_NONE,
+            );
+        }
         let lba = u64::from(read_be_u32(&cdb[2..6]));
         let blocks = u64::from(read_be_u16(&cdb[7..9]));
         // transfer == 0 means "write to end of device"
@@ -460,6 +467,13 @@ impl<D: BlockDevice> TcmuDevice<D> {
     fn write_same_16(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
         if cdb.len() < 16 {
             return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        if cdb[1] != 0 {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_INVALID_FIELD_IN_CDB,
+                ASCQ_NONE,
+            );
         }
         let lba = read_be_u64(&cdb[2..10]);
         let blocks = u64::from(read_be_u32(&cdb[10..14]));
@@ -482,12 +496,14 @@ impl<D: BlockDevice> TcmuDevice<D> {
         {
             return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, ASCQ_NONE);
         }
-        // Use the first block of data_out as the pattern, or zeros if empty.
-        let pattern: Vec<u8> = if data_out.len() >= bs as usize {
-            data_out[..bs as usize].to_vec()
-        } else {
-            vec![0u8; bs as usize]
-        };
+        if data_out.len() != bs as usize {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_INVALID_FIELD_IN_CDB,
+                ASCQ_NONE,
+            );
+        }
+        let pattern = data_out.to_vec();
         for i in 0..count {
             let offset = (lba + i) * bs;
             if self.device.write_at(offset, &pattern).is_err() {
@@ -863,6 +879,34 @@ mod tests {
             assert_eq!(resp.status, SAM_STAT_GOOD);
             assert!(resp.data.iter().all(|&b| b == 0xCC), "LBA {lba} mismatch");
         }
+    }
+
+    #[test]
+    fn write_same_rejects_empty_pattern() {
+        let dev = rw_device(4);
+        let mut cdb = [0_u8; 10];
+        cdb[0] = WRITE_SAME_10;
+        put_be_u32(&mut cdb[2..6], 0);
+        put_be_u16(&mut cdb[7..9], 1);
+        let resp = dev.execute(&cdb, &[]);
+        assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
+        assert_eq!(resp.sense[2], SENSE_KEY_ILLEGAL_REQUEST);
+        assert_eq!(resp.sense[12], ASC_INVALID_FIELD_IN_CDB);
+    }
+
+    #[test]
+    fn write_same_rejects_unsupported_flags() {
+        let dev = rw_device(4);
+        let pattern = vec![0xCC_u8; LOGICAL_BLOCK_SIZE as usize];
+        let mut cdb = [0_u8; 10];
+        cdb[0] = WRITE_SAME_10;
+        cdb[1] = 0x08;
+        put_be_u32(&mut cdb[2..6], 0);
+        put_be_u16(&mut cdb[7..9], 1);
+        let resp = dev.execute(&cdb, &pattern);
+        assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
+        assert_eq!(resp.sense[2], SENSE_KEY_ILLEGAL_REQUEST);
+        assert_eq!(resp.sense[12], ASC_INVALID_FIELD_IN_CDB);
     }
 
     #[test]
