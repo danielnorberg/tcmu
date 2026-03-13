@@ -110,22 +110,6 @@ mod test {
             .collect()
     }
 
-    /// Trigger a rescan on all tcm_loop SCSI hosts so that a newly-started
-    /// TCMU event loop is discovered by the kernel.
-    fn rescan_tcm_loop_hosts() {
-        let Ok(rd) = fs::read_dir("/sys/class/scsi_host") else {
-            return;
-        };
-        for entry in rd.flatten() {
-            let proc_name_path = entry.path().join("proc_name");
-            if let Ok(name) = fs::read_to_string(&proc_name_path)
-                && (name.trim() == "tcm_loop" || name.trim() == "tcm_loopback")
-            {
-                let _ = fs::write(entry.path().join("scan"), "- - -");
-            }
-        }
-    }
-
     /// Wait until a `/dev/sd*` device backed by `tcm_loop` appears that was
     /// not present in `before`.
     fn wait_for_new_tcm_loop_device(
@@ -201,11 +185,6 @@ mod test {
         let target_t = Arc::clone(&target);
         let device_t = Arc::clone(&device);
         let loop_thread = std::thread::spawn(move || target_t.run(&*device_t));
-
-        // Give the event loop a moment to open the UIO device, then trigger a
-        // SCSI rescan so the kernel discovers the now-running TCMU handler.
-        std::thread::sleep(Duration::from_millis(500));
-        rescan_tcm_loop_hosts();
 
         // ── 5. Wait for the loopback block device ─────────────────────────────
         let block_dev = wait_for_new_tcm_loop_device(&before_devices, Duration::from_secs(15))?;

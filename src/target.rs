@@ -44,8 +44,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -88,9 +89,10 @@ impl TcmuTargetBuilder {
     /// Also create a `tcm_loop` fabric so a SCSI block device (`/dev/sdX`)
     /// appears in the system. Requires the `tcm_loop` kernel module.
     ///
-    /// The loopback fabric is created inside [`build`](Self::build), before
-    /// the event loop starts. The kernel retries the initial SCSI discovery
-    /// once [`run`](TcmuTarget::run) begins processing commands.
+    /// The loopback fabric is created lazily inside [`run`](TcmuTarget::run),
+    /// after the UIO file is open and ready to service SCSI commands. This
+    /// avoids the kernel probing a LUN whose user-space handler is not yet
+    /// running.
     pub fn with_loopback(mut self) -> Self {
         self.loopback = true;
         self
@@ -127,8 +129,21 @@ impl TcmuTargetBuilder {
 pub struct TcmuTarget {
     device_configfs: PathBuf,
     uio_path: PathBuf,
-    loopback: Option<LoopbackPaths>,
+    loopback_cfg: Option<LoopbackConfig>,
+    loopback: Arc<Mutex<Option<LoopbackPaths>>>,
     stop: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct LoopbackConfig {
+    wwn: String,
+    name: String,
+}
+
+struct LoopbackStarter {
+    device_configfs: PathBuf,
+    cfg: LoopbackConfig,
+    loopback: Arc<Mutex<Option<LoopbackPaths>>>,
 }
 
 struct LoopbackPaths {
@@ -166,13 +181,12 @@ impl TcmuTarget {
         let uio_path = wait_for_uio(&uio_name, Duration::from_secs(5))
             .context("waiting for UIO device to appear")?;
 
-        // 3. Optionally create a tcm_loop loopback fabric.
-        let loopback = if cfg.loopback {
-            let wwn = cfg.wwn.unwrap_or_else(|| derive_wwn(&cfg.name));
-            Some(
-                create_loopback(&wwn, &device_configfs, &cfg.name)
-                    .context("creating loopback fabric")?,
-            )
+        // 3. Optionally remember loopback config to be activated by run().
+        let loopback_cfg = if cfg.loopback {
+            Some(LoopbackConfig {
+                wwn: cfg.wwn.unwrap_or_else(|| derive_wwn(&cfg.name)),
+                name: cfg.name,
+            })
         } else {
             None
         };
@@ -180,7 +194,8 @@ impl TcmuTarget {
         Ok(Self {
             device_configfs,
             uio_path,
-            loopback,
+            loopback_cfg,
+            loopback: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -202,14 +217,26 @@ impl TcmuTarget {
     /// Returns only on I/O error (e.g. the UIO device was destroyed). The
     /// configfs target remains active until this [`TcmuTarget`] is dropped.
     pub fn run<D: BlockDevice>(&self, device: &TcmuDevice<D>) -> anyhow::Result<()> {
-        run_event_loop(&self.uio_path, device, &self.stop)
+        let loopback_starter = self.loopback_cfg.clone().map(|cfg| LoopbackStarter {
+            device_configfs: self.device_configfs.clone(),
+            cfg,
+            loopback: Arc::clone(&self.loopback),
+        });
+        run_event_loop(
+            &self.uio_path,
+            device,
+            Arc::clone(&self.stop),
+            loopback_starter,
+        )
     }
 }
 
 impl Drop for TcmuTarget {
     fn drop(&mut self) {
         // Best-effort — ignore individual errors so drop never panics.
-        if let Some(lb) = &self.loopback {
+        if let Ok(loopback) = self.loopback.lock()
+            && let Some(lb) = loopback.as_ref()
+        {
             let _ = fs::write(lb.tpgt_dir.join("enable"), "0");
             let _ = fs::remove_file(&lb.lun_symlink);
             let _ = fs::remove_dir(lb.tpgt_dir.join("lun").join("lun_0"));
@@ -221,6 +248,34 @@ impl Drop for TcmuTarget {
         // For LIO backstores, `enable` is write-once: only `"1"` is accepted.
         // Removal of the configfs device directory performs teardown.
         let _ = fs::remove_dir(&self.device_configfs);
+    }
+}
+
+impl LoopbackStarter {
+    fn run(self, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
+        // Let the event loop arm UIO interrupts and enter poll() first.
+        std::thread::sleep(Duration::from_millis(50));
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let mut loopback = self
+            .loopback
+            .lock()
+            .map_err(|_| anyhow::anyhow!("loopback state lock poisoned"))?;
+        if loopback.is_some() {
+            return Ok(());
+        }
+
+        let paths = create_loopback(&self.cfg.wwn, &self.device_configfs, &self.cfg.name)
+            .context("creating loopback fabric")?;
+        *loopback = Some(paths);
+        drop(loopback);
+
+        if wait_for_tcm_loop_host(Duration::from_secs(5), &stop) {
+            rescan_tcm_loop_hosts();
+        }
+        Ok(())
     }
 }
 
@@ -256,6 +311,46 @@ fn create_loopback(wwn: &str, device_configfs: &Path, name: &str) -> anyhow::Res
         tpgt_dir,
         lun_symlink,
     })
+}
+
+/// Trigger a rescan on all tcm_loop SCSI hosts so the newly created loopback
+/// target is discovered immediately.
+fn rescan_tcm_loop_hosts() {
+    let Ok(rd) = fs::read_dir("/sys/class/scsi_host") else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let proc_name_path = entry.path().join("proc_name");
+        if let Ok(name) = fs::read_to_string(&proc_name_path)
+            && (name.trim() == "tcm_loop" || name.trim() == "tcm_loopback")
+        {
+            let _ = fs::write(entry.path().join("scan"), "- - -");
+        }
+    }
+}
+
+fn wait_for_tcm_loop_host(timeout: Duration, stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(rd) = fs::read_dir("/sys/class/scsi_host") else {
+            return false;
+        };
+        for entry in rd.flatten() {
+            let proc_name_path = entry.path().join("proc_name");
+            if let Ok(name) = fs::read_to_string(&proc_name_path)
+                && (name.trim() == "tcm_loop" || name.trim() == "tcm_loopback")
+            {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Poll `/sys/class/uio/` until a device whose `name` file matches appears.
@@ -379,7 +474,8 @@ fn uio_mmap_size(uio_path: &Path) -> anyhow::Result<usize> {
 fn run_event_loop<D: BlockDevice>(
     uio_path: &Path,
     device: &TcmuDevice<D>,
-    stop: &AtomicBool,
+    stop: Arc<AtomicBool>,
+    loopback_starter: Option<LoopbackStarter>,
 ) -> anyhow::Result<()> {
     let mut uio = fs::OpenOptions::new()
         .read(true)
@@ -409,7 +505,36 @@ fn run_event_loop<D: BlockDevice>(
     let cmdr_off = unsafe { ru32(base, MB_CMDR_OFF) } as usize;
     let cmdr_size = unsafe { ru32(base, MB_CMDR_SIZE) } as usize;
     let cmdr = unsafe { base.add(cmdr_off) };
-    loop {
+    // Arm the UIO fd before creating loopback fabric so the initial SCSI
+    // discovery can interrupt user space immediately.
+    uio.write_all(&1u32.to_ne_bytes())?;
+    let mut loopback_rx = None;
+    let mut loopback_handle = None;
+    if let Some(starter) = loopback_starter {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let stop_t = Arc::clone(&stop);
+        loopback_handle = Some(std::thread::spawn(move || {
+            let _ = tx.send(starter.run(stop_t));
+        }));
+        loopback_rx = Some(rx);
+    }
+
+    let result = loop {
+        if let Some(rx) = loopback_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(())) => loopback_rx = None,
+                Ok(Err(err)) => {
+                    stop.store(true, Ordering::Release);
+                    break Err(err);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    stop.store(true, Ordering::Release);
+                    break Err(anyhow::anyhow!("loopback setup thread disconnected"));
+                }
+            }
+        }
+
         // Poll with a 100 ms timeout so the stop flag is checked promptly.
         let mut pfd = libc::pollfd {
             fd: uio.as_raw_fd(),
@@ -421,19 +546,23 @@ fn run_event_loop<D: BlockDevice>(
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
                 if stop.load(Ordering::Acquire) {
-                    return Ok(());
+                    break Ok(());
                 }
                 continue;
             }
-            return Err(err.into());
+            stop.store(true, Ordering::Release);
+            break Err(err.into());
         }
         if stop.load(Ordering::Acquire) {
-            return Ok(());
+            break Ok(());
         }
         if ret > 0 {
             // POLLIN: consume the interrupt counter so the next poll starts fresh.
             let mut buf = [0u8; 4];
-            uio.read_exact(&mut buf)?;
+            if let Err(err) = uio.read_exact(&mut buf) {
+                stop.store(true, Ordering::Release);
+                break Err(err.into());
+            }
         }
         // Drain all pending entries (including commands queued before the UIO
         // file was opened, which don't generate a new POLLIN event).
@@ -513,6 +642,19 @@ fn run_event_loop<D: BlockDevice>(
         }
 
         // Notify the kernel that cmd_tail has moved.
-        uio.write_all(&1u32.to_ne_bytes())?;
+        if let Err(err) = uio.write_all(&1u32.to_ne_bytes()) {
+            stop.store(true, Ordering::Release);
+            break Err(err.into());
+        }
+    };
+
+    if let Some(handle) = loopback_handle.take() {
+        if result.is_err() {
+            let _ = handle.join();
+        } else if handle.join().is_err() {
+            return Err(anyhow::anyhow!("loopback setup thread panicked"));
+        }
     }
+
+    result
 }
