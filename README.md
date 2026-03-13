@@ -103,4 +103,4 @@ See the [`examples/`](examples/) directory:
 
 - [`ram_disk.rs`](examples/ram_disk.rs) — a simple in-memory block device that exercises the SCSI command layer without any kernel involvement; useful as a template or for testing.
 
-- [`ext4_loopback.rs`](examples/ext4_loopback.rs) — serves a filesystem image file (ext4, or any format) as a real kernel block device via the Linux TCMU UIO interface. The running process handles every SCSI READ command; the image can then be mounted read-only. Includes step-by-step setup instructions for configfs and tcm_loop in the file's doc comments.
+- [`loopback.rs`](examples/loopback.rs) — serves a filesystem image file (ext4, or any format) as a real kernel block device via the Linux TCMU UIO interface. The running process handles every SCSI READ command; the image can then be mounted read-only. Includes step-by-step setup instructions for configfs and tcm_loop in the file's doc comments.
