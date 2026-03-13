@@ -218,7 +218,8 @@ impl Drop for TcmuTarget {
             let _ = fs::remove_dir(&lb.tpgt_dir);
             let _ = fs::remove_dir(&lb.wwn_dir);
         }
-        let _ = fs::write(self.device_configfs.join("enable"), "0");
+        // For LIO backstores, `enable` is write-once: only `"1"` is accepted.
+        // Removal of the configfs device directory performs teardown.
         let _ = fs::remove_dir(&self.device_configfs);
     }
 }
