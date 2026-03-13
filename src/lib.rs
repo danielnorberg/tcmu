@@ -2,6 +2,15 @@
 //!
 //! Implement [`BlockDevice`] for your backing store, then wrap it in
 //! [`TcmuDevice`] to get a SCSI command executor suitable for use with TCMU.
+//!
+//! # Optional: Linux target management
+//!
+//! Enable the `linux-target` feature for [`target`], which handles the
+//! configfs lifecycle (creating/destroying the TCMU device in the kernel) and
+//! the UIO event loop, so you don't have to write that plumbing yourself.
+
+#[cfg(all(target_os = "linux", feature = "linux-target"))]
+pub mod target;
 
 const LOGICAL_BLOCK_SIZE: u32 = 512;
 const INQUIRY: u8 = 0x12;

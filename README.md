@@ -9,25 +9,25 @@ A generic SCSI/TCMU command processor for implementing read-only user-space bloc
 1. A `BlockDevice` trait for your backing store
 2. A `TcmuDeviceConfig` describing how the device identifies itself to the SCSI initiator
 
-The resulting `TcmuDevice` processes raw CDB bytes and returns a `TcmuResponse` (status + data + sense). Wiring that into the actual TCMU kernel interface (via `/dev/tcmu-*` or a library like [tcmu-runner](https://github.com/open-iscsi/tcmu-runner)) is left to the caller.
+The resulting `TcmuDevice` processes raw CDB bytes and returns a `TcmuResponse` (status + data + sense). Wiring that into the actual TCMU kernel interface is left to the caller — or you can use the optional `linux-target` feature (see below) to get that for free.
 
 ## Supported SCSI commands
 
-| Command                    | Opcode | Behaviour                            |
-|----------------------------|--------|--------------------------------------|
-| TEST UNIT READY            | 0x00   | Always succeeds                      |
-| REQUEST SENSE              | 0x03   | Returns NO SENSE                     |
-| INQUIRY                    | 0x12   | Standard + VPD pages 0x00/0x80/0x83  |
-| READ(6)                    | 0x08   | Delegates to `BlockDevice::read_at`  |
-| READ(10)                   | 0x28   | Delegates to `BlockDevice::read_at`  |
-| READ(12)                   | 0xa8   | Delegates to `BlockDevice::read_at`  |
-| READ(16)                   | 0x88   | Delegates to `BlockDevice::read_at`  |
-| READ CAPACITY(10)          | 0x25   | Derived from `BlockDevice::size_bytes`|
-| SERVICE ACTION IN(16)      | 0x9e   | READ CAPACITY(16) service action     |
-| MODE SENSE(6)/(10)         | 0x1a/0x5a | Caching page (read-only bit set)  |
-| SYNCHRONIZE CACHE(10)/(16) | 0x35/0x91 | No-op (always succeeds)          |
-| WRITE(6/10/12/16)          | —      | WRITE PROTECTED check condition      |
-| WRITE SAME(10/16)          | —      | WRITE PROTECTED check condition      |
+| Command                    | Opcode    | Behaviour                             |
+|----------------------------|-----------|---------------------------------------|
+| TEST UNIT READY            | 0x00      | Always succeeds                       |
+| REQUEST SENSE              | 0x03      | Returns NO SENSE                      |
+| INQUIRY                    | 0x12      | Standard + VPD pages 0x00/0x80/0x83   |
+| READ(6)                    | 0x08      | Delegates to `BlockDevice::read_at`   |
+| READ(10)                   | 0x28      | Delegates to `BlockDevice::read_at`   |
+| READ(12)                   | 0xa8      | Delegates to `BlockDevice::read_at`   |
+| READ(16)                   | 0x88      | Delegates to `BlockDevice::read_at`   |
+| READ CAPACITY(10)          | 0x25      | Derived from `BlockDevice::size_bytes`|
+| SERVICE ACTION IN(16)      | 0x9e      | READ CAPACITY(16) service action      |
+| MODE SENSE(6)/(10)         | 0x1a/0x5a | Caching page (read-only bit set)      |
+| SYNCHRONIZE CACHE(10)/(16) | 0x35/0x91 | No-op (always succeeds)               |
+| WRITE(6/10/12/16)          | —         | WRITE PROTECTED check condition       |
+| WRITE SAME(10/16)          | —         | WRITE PROTECTED check condition       |
 
 ## Usage
 
@@ -97,10 +97,44 @@ assert_eq!(response.status, 0x00); // SAM_STAT_GOOD
 
 On error, `status` is `0x02` (CHECK CONDITION) and `sense` contains fixed-format sense data.
 
+## Optional: Linux target management (`linux-target` feature)
+
+Enable the `linux-target` feature to get `tcmu::target::TcmuTarget`, which handles the full kernel integration automatically:
+
+- Creates and tears down the TCMU configfs entries
+- Discovers the resulting `/dev/uioN` device
+- Optionally sets up a `tcm_loop` fabric so a `/dev/sdX` block device appears
+- Runs the UIO ring-buffer event loop
+
+```toml
+[dependencies]
+tcmu = { git = "https://github.com/danielnorberg/tcmu", features = ["linux-target"] }
+```
+
+```rust
+use tcmu::target::TcmuTarget;
+
+let target = TcmuTarget::builder()
+    .name("mydev")
+    .size_bytes(64 << 20)
+    .with_loopback()   // also creates a tcm_loop LUN → /dev/sdX
+    .build()?;
+
+eprintln!("UIO device: {}", target.uio_path().display());
+
+// Blocks until error or signal; cleans up configfs on drop.
+target.run(&device)?;
+```
+
+Without the feature, the crate has no Linux-specific dependencies and compiles on any platform.
+
 ## Examples
 
 See the [`examples/`](examples/) directory:
 
-- [`ram_disk.rs`](examples/ram_disk.rs) — a simple in-memory block device that exercises the SCSI command layer without any kernel involvement; useful as a template or for testing.
+- [`ram_disk.rs`](examples/ram_disk.rs) — an in-memory block device that exercises the SCSI command layer without any kernel involvement. No feature flags required.
 
-- [`loopback.rs`](examples/loopback.rs) — serves a filesystem image file (ext4, or any format) as a real kernel block device via the Linux TCMU UIO interface. The running process handles every SCSI READ command; the image can then be mounted read-only. Includes step-by-step setup instructions for configfs and tcm_loop in the file's doc comments.
+- [`loopback.rs`](examples/loopback.rs) — serves a filesystem image file as a mountable kernel block device using `TcmuTarget`. Requires the `linux-target` feature and root on Linux.
+  ```sh
+  sudo cargo run --example loopback --features linux-target -- /tmp/ext4.img
+  ```

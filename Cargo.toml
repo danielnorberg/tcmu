@@ -6,8 +6,11 @@ description = "Generic SCSI/TCMU command processor for implementing read-only us
 license = "MIT"
 repository = "https://github.com/danielnorberg/tcmu"
 
+[features]
+## Enables `tcmu::target`: configfs lifecycle management and UIO event loop.
+## Requires Linux with `target_core_user` (and optionally `tcm_loop`) loaded.
+linux-target = ["dep:libc"]
+
 [dependencies]
 anyhow = "1.0"
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }

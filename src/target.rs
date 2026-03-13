@@ -1,0 +1,469 @@
+//! Linux configfs lifecycle management and UIO event loop for TCMU targets.
+//!
+//! # Typical usage
+//!
+//! ```no_run
+//! use tcmu::{BlockDevice, TcmuDevice, TcmuDeviceConfig};
+//! use tcmu::target::TcmuTarget;
+//! # struct MyDevice;
+//! # impl BlockDevice for MyDevice {
+//! #     fn size_bytes(&self) -> u64 { 4096 }
+//! #     fn read_at(&self, _: u64, _: usize) -> anyhow::Result<impl AsRef<[u8]>> { Ok(vec![0u8]) }
+//! #     fn id_bytes(&self) -> Vec<u8> { vec![] }
+//! # }
+//!
+//! let target = TcmuTarget::builder()
+//!     .name("mydev")
+//!     .size_bytes(64 << 20)
+//!     .with_loopback()        // also sets up a tcm_loop LUN → /dev/sdX
+//!     .build()?;
+//!
+//! eprintln!("UIO device: {}", target.uio_path().display());
+//!
+//! let device = TcmuDevice::new(MyDevice, TcmuDeviceConfig {
+//!     vendor_id:        *b"VENDOR  ",
+//!     product_id:       *b"PRODUCT         ",
+//!     product_revision: *b"0001",
+//!     device_id_prefix: "mydev".to_string(),
+//! });
+//!
+//! // Blocks until I/O error or signal; cleans up configfs on drop.
+//! target.run(&device)?;
+//! # anyhow::Ok(())
+//! ```
+//!
+//! # Kernel modules required
+//!
+//! ```sh
+//! modprobe target_core_mod target_core_user
+//! modprobe tcm_loop  # only if using .with_loopback()
+//! mount -t configfs configfs /sys/kernel/config  # if not already mounted
+//! ```
+
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{fence, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+
+use crate::{BlockDevice, TcmuDevice};
+
+const CONFIGFS: &str = "/sys/kernel/config/target";
+
+// ─── Builder ──────────────────────────────────────────────────────────────────
+
+/// Builder for a [`TcmuTarget`].
+pub struct TcmuTargetBuilder {
+    name: String,
+    size_bytes: u64,
+    hba_index: u32,
+    loopback: bool,
+    wwn: Option<String>,
+}
+
+impl Default for TcmuTargetBuilder {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            size_bytes: 0,
+            hba_index: 0,
+            loopback: false,
+            wwn: None,
+        }
+    }
+}
+
+impl TcmuTargetBuilder {
+    /// Device name as it will appear in configfs (e.g. `"mydev"`).
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Total device size in bytes (must be a multiple of 512).
+    pub fn size_bytes(mut self, size: u64) -> Self {
+        self.size_bytes = size;
+        self
+    }
+
+    /// HBA index for the `user_N` configfs slot (default: `0`).
+    pub fn hba_index(mut self, idx: u32) -> Self {
+        self.hba_index = idx;
+        self
+    }
+
+    /// Also create a `tcm_loop` fabric so a SCSI block device (`/dev/sdX`)
+    /// appears in the system. Requires the `tcm_loop` kernel module.
+    ///
+    /// The loopback fabric is created inside [`build`](Self::build), before
+    /// the event loop starts. The kernel retries the initial SCSI discovery
+    /// once [`run`](TcmuTarget::run) begins processing commands.
+    pub fn with_loopback(mut self) -> Self {
+        self.loopback = true;
+        self
+    }
+
+    /// Override the auto-generated WWN used for the loopback fabric.
+    ///
+    /// If not set, a deterministic WWN is derived from the device name.
+    pub fn wwn(mut self, wwn: impl Into<String>) -> Self {
+        self.wwn = Some(wwn.into());
+        self
+    }
+
+    /// Create the TCMU target.
+    ///
+    /// This writes to configfs, which requires root and the `target_core_user`
+    /// kernel module to be loaded.
+    pub fn build(self) -> anyhow::Result<TcmuTarget> {
+        anyhow::ensure!(!self.name.is_empty(), "device name must not be empty");
+        anyhow::ensure!(self.size_bytes > 0, "size_bytes must be > 0");
+        anyhow::ensure!(self.size_bytes % 512 == 0, "size_bytes must be a multiple of 512");
+        TcmuTarget::create(self)
+    }
+}
+
+// ─── TcmuTarget ───────────────────────────────────────────────────────────────
+
+/// A TCMU block device target registered with the Linux kernel.
+///
+/// Cleans up the configfs entries on [`Drop`].
+pub struct TcmuTarget {
+    device_configfs: PathBuf,
+    uio_path: PathBuf,
+    loopback: Option<LoopbackPaths>,
+}
+
+struct LoopbackPaths {
+    wwn_dir: PathBuf,
+    tpgt_dir: PathBuf,
+    lun_symlink: PathBuf,
+}
+
+impl TcmuTarget {
+    /// Create a [`TcmuTargetBuilder`].
+    pub fn builder() -> TcmuTargetBuilder {
+        TcmuTargetBuilder::default()
+    }
+
+    fn create(cfg: TcmuTargetBuilder) -> anyhow::Result<Self> {
+        // 1. Create the TCMU configfs device and enable it.
+        let device_configfs = PathBuf::from(CONFIGFS)
+            .join("core")
+            .join(format!("user_{}", cfg.hba_index))
+            .join(&cfg.name);
+
+        fs::create_dir_all(&device_configfs)
+            .with_context(|| format!("creating {}", device_configfs.display()))?;
+
+        fs::write(device_configfs.join("dev_size"), cfg.size_bytes.to_string())
+            .context("writing dev_size")?;
+
+        fs::write(device_configfs.join("enable"), "1").context("enabling device")?;
+
+        // 2. Find the UIO device the kernel created (appears under /sys/class/uio/).
+        let uio_name = format!("tcm-user{}/{}", cfg.hba_index, cfg.name);
+        let uio_path = wait_for_uio(&uio_name, Duration::from_secs(5))
+            .context("waiting for UIO device to appear")?;
+
+        // 3. Optionally create a tcm_loop loopback fabric.
+        let loopback = if cfg.loopback {
+            let wwn = cfg.wwn.unwrap_or_else(|| derive_wwn(&cfg.name));
+            Some(
+                create_loopback(&wwn, &device_configfs, &cfg.name)
+                    .context("creating loopback fabric")?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Self { device_configfs, uio_path, loopback })
+    }
+
+    /// Path to the UIO character device (e.g. `/dev/uio0`).
+    pub fn uio_path(&self) -> &Path {
+        &self.uio_path
+    }
+
+    /// Run the blocking SCSI command loop.
+    ///
+    /// Returns only on I/O error (e.g. the UIO device was destroyed). The
+    /// configfs target remains active until this [`TcmuTarget`] is dropped.
+    pub fn run<D: BlockDevice>(&self, device: &TcmuDevice<D>) -> anyhow::Result<()> {
+        run_event_loop(&self.uio_path, device)
+    }
+}
+
+impl Drop for TcmuTarget {
+    fn drop(&mut self) {
+        // Best-effort — ignore individual errors so drop never panics.
+        if let Some(lb) = &self.loopback {
+            let _ = fs::write(lb.tpgt_dir.join("enable"), "0");
+            let _ = fs::remove_file(&lb.lun_symlink);
+            let _ = fs::remove_dir(lb.tpgt_dir.join("lun").join("lun_0"));
+            let _ = fs::remove_dir(lb.tpgt_dir.join("lun"));
+            let _ = fs::remove_dir(&lb.tpgt_dir);
+            let _ = fs::remove_dir(&lb.wwn_dir);
+        }
+        let _ = fs::write(self.device_configfs.join("enable"), "0");
+        let _ = fs::remove_dir(&self.device_configfs);
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+fn create_loopback(
+    wwn: &str,
+    device_configfs: &Path,
+    name: &str,
+) -> anyhow::Result<LoopbackPaths> {
+    let wwn_dir = PathBuf::from(CONFIGFS).join("loopback").join(wwn);
+    let tpgt_dir = wwn_dir.join("tpgt_1");
+    let lun_dir = tpgt_dir.join("lun").join("lun_0");
+    let lun_symlink = lun_dir.join(name);
+
+    fs::create_dir_all(&lun_dir)
+        .with_context(|| format!("creating LUN directory {}", lun_dir.display()))?;
+
+    std::os::unix::fs::symlink(device_configfs, &lun_symlink).with_context(|| {
+        format!(
+            "creating LUN symlink {} -> {}",
+            lun_symlink.display(),
+            device_configfs.display()
+        )
+    })?;
+
+    fs::write(tpgt_dir.join("enable"), "1").context("enabling tpgt")?;
+
+    Ok(LoopbackPaths { wwn_dir, tpgt_dir, lun_symlink })
+}
+
+/// Poll `/sys/class/uio/` until a device whose `name` file matches appears.
+fn wait_for_uio(expected_name: &str, timeout: Duration) -> anyhow::Result<PathBuf> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for entry in fs::read_dir("/sys/class/uio").context("reading /sys/class/uio")? {
+            let entry = entry?;
+            if let Ok(name) = fs::read_to_string(entry.path().join("name")) {
+                if name.trim() == expected_name {
+                    return Ok(PathBuf::from("/dev").join(entry.file_name()));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "UIO device '{expected_name}' did not appear within {}s",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Derive a deterministic NAA WWN from a device name so the loopback target
+/// gets a stable identity across restarts.
+fn derive_wwn(name: &str) -> String {
+    let mut hash: u64 = 5381;
+    for byte in name.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(u64::from(byte));
+    }
+    format!("naa.6{hash:015x}")
+}
+
+// ─── UIO event loop ───────────────────────────────────────────────────────────
+//
+// Shared memory layout (from <linux/target_core_user.h>, all __packed):
+//
+//  Mailbox (at mmap base):
+//    offset  0: u16 version
+//    offset  2: u16 flags
+//    offset  4: u32 cmdr_off   — byte offset of ring buffer from mmap base
+//    offset  8: u32 cmdr_size  — ring buffer size in bytes
+//    offset 12: u32 cmd_head   — written by kernel, read by user space
+//    offset 64: u32 cmd_tail   — written by user space (__aligned(64))
+//
+//  Command entry (at cmdr + tail):
+//    offset  0: u32 len_op     — bits[1:0]=opcode, bits[31:2]=entry length
+//    offset  4: u16 cmd_id
+//    offset  6: u8  kflags / u8 uflags
+//    --- request (union) ---
+//    offset  8: u32 iov_cnt
+//    offset 12: u32 iov_bidi_cnt
+//    offset 16: u32 iov_dif_cnt
+//    offset 20: u64 cdb_off    — offset from mmap base to CDB bytes
+//    offset 28: u64 pad × 2
+//    offset 44: iovec[iov_cnt] — each: u64 base_offset, u64 len
+//    --- response (same union, written by user space) ---
+//    offset  8: u8  scsi_status
+//    offset 16: u32 sense_buffer_len
+//    offset 20: u8[96] sense_buffer
+
+const TCMU_OP_PAD: u32 = 0;
+const TCMU_OP_CMD: u32 = 1;
+const TCMU_SENSE_BUFFERSIZE: usize = 96;
+
+const MB_CMDR_OFF: usize = 4;
+const MB_CMDR_SIZE: usize = 8;
+const MB_CMD_HEAD: usize = 12;
+const MB_CMD_TAIL: usize = 64;
+
+const ENTRY_LEN_OP: usize = 0;
+const ENTRY_IOV_CNT: usize = 8;
+const ENTRY_CDB_OFF: usize = 20;
+const ENTRY_IOVS: usize = 44;
+const ENTRY_RSP_STATUS: usize = 8;
+const ENTRY_RSP_SENSE_LEN: usize = 16;
+const ENTRY_RSP_SENSE_BUF: usize = 20;
+
+const IOV_BASE: usize = 0;
+const IOV_LEN: usize = 8;
+const IOV_STRIDE: usize = 16;
+
+#[inline]
+unsafe fn ru32(base: *const u8, off: usize) -> u32 {
+    unsafe { (base.add(off) as *const u32).read_unaligned() }
+}
+
+#[inline]
+unsafe fn ru64(base: *const u8, off: usize) -> u64 {
+    unsafe { (base.add(off) as *const u64).read_unaligned() }
+}
+
+#[inline]
+unsafe fn rv32(base: *const u8, off: usize) -> u32 {
+    unsafe { (base.add(off) as *const u32).read_volatile() }
+}
+
+#[inline]
+unsafe fn wv32(base: *mut u8, off: usize, val: u32) {
+    unsafe { (base.add(off) as *mut u32).write_volatile(val) };
+    fence(Ordering::SeqCst);
+}
+
+fn uio_mmap_size(uio_path: &Path) -> anyhow::Result<usize> {
+    let name = uio_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid UIO path"))?;
+    let sysfs = format!("/sys/class/uio/{name}/maps/map0/size");
+    let raw = fs::read_to_string(&sysfs).with_context(|| format!("reading {sysfs}"))?;
+    let hex = raw.trim().trim_start_matches("0x");
+    Ok(usize::from_str_radix(hex, 16)?)
+}
+
+fn run_event_loop<D: BlockDevice>(uio_path: &Path, device: &TcmuDevice<D>) -> anyhow::Result<()> {
+    let mut uio = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(uio_path)
+        .with_context(|| format!("opening {}", uio_path.display()))?;
+
+    let mmap_size = uio_mmap_size(uio_path)?;
+
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mmap_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            uio.as_raw_fd(),
+            0,
+        )
+    };
+    anyhow::ensure!(
+        base != libc::MAP_FAILED,
+        "mmap failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let base = base as *mut u8;
+
+    let cmdr_off = unsafe { ru32(base, MB_CMDR_OFF) } as usize;
+    let cmdr_size = unsafe { ru32(base, MB_CMDR_SIZE) } as usize;
+    let cmdr = unsafe { base.add(cmdr_off) };
+
+    loop {
+        // Block until the kernel signals at least one new command.
+        let mut buf = [0u8; 4];
+        uio.read_exact(&mut buf)?;
+
+        // Drain all pending entries.
+        loop {
+            let head = unsafe { rv32(base, MB_CMD_HEAD) } as usize;
+            let tail = unsafe { rv32(base, MB_CMD_TAIL) } as usize;
+            if head == tail {
+                break;
+            }
+
+            let entry = unsafe { cmdr.add(tail) };
+            let len_op = unsafe { ru32(entry, ENTRY_LEN_OP) };
+            let opcode = len_op & 0x3;
+            let entry_len = (len_op >> 2) as usize;
+
+            // PAD entry: ring wrapped around, restart from the beginning.
+            if opcode == TCMU_OP_PAD {
+                unsafe { wv32(base, MB_CMD_TAIL, 0) };
+                continue;
+            }
+
+            if opcode != TCMU_OP_CMD || entry_len == 0 {
+                let new_tail = (tail + entry_len.max(8)) % cmdr_size;
+                unsafe { wv32(base, MB_CMD_TAIL, new_tail as u32) };
+                continue;
+            }
+
+            let iov_cnt = unsafe { ru32(entry, ENTRY_IOV_CNT) } as usize;
+            let cdb_off = unsafe { ru64(entry, ENTRY_CDB_OFF) } as usize;
+            let cdb = unsafe { std::slice::from_raw_parts(base.add(cdb_off), 16) };
+
+            // For write commands (which we reject) the IOVs carry the
+            // initiator data; gather it so execute() can inspect it.
+            let iov_arr = unsafe { entry.add(ENTRY_IOVS) };
+            let mut data_out = Vec::new();
+            for i in 0..iov_cnt {
+                let iov = unsafe { iov_arr.add(i * IOV_STRIDE) };
+                let off = unsafe { ru64(iov, IOV_BASE) } as usize;
+                let len = unsafe { ru64(iov, IOV_LEN) } as usize;
+                data_out.extend_from_slice(unsafe { std::slice::from_raw_parts(base.add(off), len) });
+            }
+
+            let response = device.execute(cdb, &data_out);
+
+            // For successful reads, scatter response data into the IOV buffers.
+            if response.status == 0x00 && !response.data.is_empty() {
+                let mut src = response.data.as_slice();
+                for i in 0..iov_cnt {
+                    if src.is_empty() {
+                        break;
+                    }
+                    let iov = unsafe { iov_arr.add(i * IOV_STRIDE) };
+                    let off = unsafe { ru64(iov, IOV_BASE) } as usize;
+                    let len = (unsafe { ru64(iov, IOV_LEN) } as usize).min(src.len());
+                    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(off), len) };
+                    src = &src[len..];
+                }
+            }
+
+            // Write status and sense data back into the entry.
+            unsafe {
+                entry.add(ENTRY_RSP_STATUS).write(response.status);
+                let sense_len = response.sense.len().min(TCMU_SENSE_BUFFERSIZE) as u32;
+                (entry.add(ENTRY_RSP_SENSE_LEN) as *mut u32).write_unaligned(sense_len);
+                std::ptr::copy_nonoverlapping(
+                    response.sense.as_ptr(),
+                    entry.add(ENTRY_RSP_SENSE_BUF),
+                    sense_len as usize,
+                );
+            }
+
+            // Advance cmd_tail to signal completion to the kernel.
+            let new_tail = (tail + entry_len) % cmdr_size;
+            unsafe { wv32(base, MB_CMD_TAIL, new_tail as u32) };
+        }
+
+        // Notify the kernel that cmd_tail has moved.
+        uio.write_all(&1u32.to_ne_bytes())?;
+    }
+}
