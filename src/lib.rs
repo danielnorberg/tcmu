@@ -34,7 +34,9 @@ const WRITE_SAME_10: u8 = 0x41;
 const WRITE_SAME_16: u8 = 0x93;
 const SYNCHRONIZE_CACHE_10: u8 = 0x35;
 const SYNCHRONIZE_CACHE_16: u8 = 0x91;
+const MODE_SELECT_6: u8 = 0x15;
 const MODE_SENSE_6: u8 = 0x1a;
+const MODE_SELECT_10: u8 = 0x55;
 const MODE_SENSE_10: u8 = 0x5a;
 
 const SAM_STAT_GOOD: u8 = 0x00;
@@ -49,7 +51,9 @@ const SENSE_KEY_MEDIUM_ERROR: u8 = 0x03;
 const SENSE_KEY_ILLEGAL_REQUEST: u8 = 0x05;
 const SENSE_KEY_DATA_PROTECT: u8 = 0x07;
 const ASC_INVALID_OPCODE: u8 = 0x20;
+const ASC_PARAMETER_LIST_LENGTH_ERROR: u8 = 0x1a;
 const ASC_INVALID_FIELD_IN_CDB: u8 = 0x24;
+const ASC_INVALID_FIELD_IN_PARAMETER_LIST: u8 = 0x26;
 const ASCQ_NONE: u8 = 0x00;
 const ASC_READ_ERROR: u8 = 0x11;
 const ASC_LBA_OUT_OF_RANGE: u8 = 0x21;
@@ -140,7 +144,9 @@ impl<D: BlockDevice> TcmuDevice<D> {
             INQUIRY => self.inquiry(cdb),
             READ_CAPACITY_10 => self.read_capacity_10(cdb),
             SERVICE_ACTION_IN_16 => self.service_action_in_16(cdb),
+            MODE_SELECT_6 => self.mode_select_6(cdb, data_out),
             MODE_SENSE_6 => self.mode_sense_6(cdb),
+            MODE_SELECT_10 => self.mode_select_10(cdb, data_out),
             MODE_SENSE_10 => self.mode_sense_10(cdb),
             READ_6 => self.read_6(cdb),
             READ_10 => self.read_10(cdb),
@@ -328,6 +334,94 @@ impl<D: BlockDevice> TcmuDevice<D> {
             }
             _ => None,
         }
+    }
+
+    fn mode_select_6(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
+        if cdb.len() < 6 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let param_len = cdb[4] as usize;
+        if param_len == 0 {
+            return good(Vec::new());
+        }
+        if (cdb[1] & 0x10) == 0 || (cdb[1] & 0x01) != 0 {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_INVALID_FIELD_IN_CDB,
+                ASCQ_NONE,
+            );
+        }
+        if data_out.len() < param_len || param_len < 4 {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_PARAMETER_LIST_LENGTH_ERROR,
+                ASCQ_NONE,
+            );
+        }
+        let params = &data_out[..param_len];
+        self.validate_mode_select_params(params, 4, usize::from(params[3]))
+    }
+
+    fn mode_select_10(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
+        if cdb.len() < 10 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let param_len = read_be_u16(&cdb[7..9]) as usize;
+        if param_len == 0 {
+            return good(Vec::new());
+        }
+        if (cdb[1] & 0x10) == 0 || (cdb[1] & 0x01) != 0 {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_INVALID_FIELD_IN_CDB,
+                ASCQ_NONE,
+            );
+        }
+        if data_out.len() < param_len || param_len < 8 {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_PARAMETER_LIST_LENGTH_ERROR,
+                ASCQ_NONE,
+            );
+        }
+        let params = &data_out[..param_len];
+        self.validate_mode_select_params(params, 8, usize::from(read_be_u16(&params[6..8])))
+    }
+
+    fn validate_mode_select_params(
+        &self,
+        params: &[u8],
+        header_len: usize,
+        block_desc_len: usize,
+    ) -> TcmuResponse {
+        if block_desc_len != 0 {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_INVALID_FIELD_IN_PARAMETER_LIST,
+                ASCQ_NONE,
+            );
+        }
+        let expected_page = self
+            .mode_sense_page(MODE_SENSE_PAGE_CODE_CACHING)
+            .expect("caching mode page is supported");
+        let page_end = header_len + expected_page.len();
+        if params.len() < page_end {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_PARAMETER_LIST_LENGTH_ERROR,
+                ASCQ_NONE,
+            );
+        }
+        if params[header_len..page_end] != expected_page
+            || params[page_end..].iter().any(|&byte| byte != 0)
+        {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_INVALID_FIELD_IN_PARAMETER_LIST,
+                ASCQ_NONE,
+            );
+        }
+        good(Vec::new())
     }
 
     fn read_6(&self, cdb: &[u8]) -> TcmuResponse {
@@ -915,6 +1009,64 @@ mod tests {
         let resp = dev.execute(&[MODE_SENSE_6, 0, MODE_SENSE_PAGE_CODE_ALL, 0, 255, 0], &[]);
         assert_eq!(resp.status, SAM_STAT_GOOD);
         assert_eq!(resp.data[2] & 0x80, 0x00, "WP bit should be clear");
+    }
+
+    #[test]
+    fn mode_select_6_accepts_static_caching_page() {
+        let dev = rw_device(4);
+        let sense = dev.execute(&[MODE_SENSE_6, 0, MODE_SENSE_PAGE_CODE_CACHING, 0, 255, 0], &[]);
+        assert_eq!(sense.status, SAM_STAT_GOOD);
+        let resp = dev.execute(
+            &[MODE_SELECT_6, 0x10, 0, 0, sense.data.len() as u8, 0],
+            &sense.data,
+        );
+        assert_eq!(resp.status, SAM_STAT_GOOD);
+    }
+
+    #[test]
+    fn mode_select_10_accepts_static_caching_page() {
+        let dev = rw_device(4);
+        let sense = dev.execute(
+            &[MODE_SENSE_10, 0, MODE_SENSE_PAGE_CODE_CACHING, 0, 0, 0, 0, 0, 255, 0],
+            &[],
+        );
+        assert_eq!(sense.status, SAM_STAT_GOOD);
+        let mut cdb = [0_u8; 10];
+        cdb[0] = MODE_SELECT_10;
+        cdb[1] = 0x10;
+        put_be_u16(&mut cdb[7..9], sense.data.len() as u16);
+        let resp = dev.execute(&cdb, &sense.data);
+        assert_eq!(resp.status, SAM_STAT_GOOD);
+    }
+
+    #[test]
+    fn mode_select_requires_pf_bit() {
+        let dev = rw_device(4);
+        let sense = dev.execute(&[MODE_SENSE_6, 0, MODE_SENSE_PAGE_CODE_CACHING, 0, 255, 0], &[]);
+        assert_eq!(sense.status, SAM_STAT_GOOD);
+        let resp = dev.execute(
+            &[MODE_SELECT_6, 0x00, 0, 0, sense.data.len() as u8, 0],
+            &sense.data,
+        );
+        assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
+        assert_eq!(resp.sense[2], SENSE_KEY_ILLEGAL_REQUEST);
+        assert_eq!(resp.sense[12], ASC_INVALID_FIELD_IN_CDB);
+    }
+
+    #[test]
+    fn mode_select_rejects_modified_caching_page() {
+        let dev = rw_device(4);
+        let sense = dev.execute(&[MODE_SENSE_6, 0, MODE_SENSE_PAGE_CODE_CACHING, 0, 255, 0], &[]);
+        assert_eq!(sense.status, SAM_STAT_GOOD);
+        let mut params = sense.data;
+        params[4] ^= 0x01;
+        let resp = dev.execute(
+            &[MODE_SELECT_6, 0x10, 0, 0, params.len() as u8, 0],
+            &params,
+        );
+        assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
+        assert_eq!(resp.sense[2], SENSE_KEY_ILLEGAL_REQUEST);
+        assert_eq!(resp.sense[12], ASC_INVALID_FIELD_IN_PARAMETER_LIST);
     }
 
     #[test]
