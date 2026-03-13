@@ -189,12 +189,21 @@ impl<D: BlockDevice> TcmuDevice<D> {
             buf[32..36].copy_from_slice(&self.config.product_revision);
             buf
         } else {
-            self.vpd_page(page_code)
+            match self.vpd_page(page_code) {
+                Some(page) => page,
+                None => {
+                    return check_condition(
+                        SENSE_KEY_ILLEGAL_REQUEST,
+                        ASC_INVALID_FIELD_IN_CDB,
+                        ASCQ_NONE,
+                    );
+                }
+            }
         };
         good(truncate_to_alloc_len(data, alloc_len))
     }
 
-    fn vpd_page(&self, page_code: u8) -> Vec<u8> {
+    fn vpd_page(&self, page_code: u8) -> Option<Vec<u8>> {
         match page_code {
             INQUIRY_VPD_SUPPORTED_PAGES => {
                 let pages = [
@@ -206,7 +215,7 @@ impl<D: BlockDevice> TcmuDevice<D> {
                 buf[1] = INQUIRY_VPD_SUPPORTED_PAGES;
                 put_be_u16(&mut buf[2..4], pages.len() as u16);
                 buf[4..].copy_from_slice(&pages);
-                buf
+                Some(buf)
             }
             INQUIRY_VPD_UNIT_SERIAL => {
                 let serial = self.hex_serial();
@@ -214,7 +223,7 @@ impl<D: BlockDevice> TcmuDevice<D> {
                 buf[1] = INQUIRY_VPD_UNIT_SERIAL;
                 put_be_u16(&mut buf[2..4], serial.len() as u16);
                 buf[4..].copy_from_slice(serial.as_bytes());
-                buf
+                Some(buf)
             }
             INQUIRY_VPD_DEVICE_ID => {
                 let ident = format!(
@@ -231,9 +240,9 @@ impl<D: BlockDevice> TcmuDevice<D> {
                 buf[5] = 0x08;
                 buf[7] = ident_bytes.len() as u8;
                 buf[8..8 + ident_bytes.len()].copy_from_slice(ident_bytes);
-                buf
+                Some(buf)
             }
-            _ => Vec::new(),
+            _ => None,
         }
     }
 
@@ -724,6 +733,15 @@ mod tests {
         assert_eq!(resp.status, SAM_STAT_GOOD);
         assert_eq!(&resp.data[8..16], b"TESTVEN ");
         assert_eq!(&resp.data[16..32], b"TESTPROD        ");
+    }
+
+    #[test]
+    fn unsupported_evpd_page_returns_illegal_request() {
+        let dev = ro_device(4);
+        let resp = dev.execute(&[INQUIRY, 0x01, 0x7f, 0, 36, 0], &[]);
+        assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
+        assert_eq!(resp.sense[2], SENSE_KEY_ILLEGAL_REQUEST);
+        assert_eq!(resp.sense[12], ASC_INVALID_FIELD_IN_CDB);
     }
 
     #[test]
