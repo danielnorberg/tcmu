@@ -57,24 +57,13 @@ const CONFIGFS: &str = "/sys/kernel/config/target";
 // ─── Builder ──────────────────────────────────────────────────────────────────
 
 /// Builder for a [`TcmuTarget`].
+#[derive(Default)]
 pub struct TcmuTargetBuilder {
     name: String,
     size_bytes: u64,
     hba_index: u32,
     loopback: bool,
     wwn: Option<String>,
-}
-
-impl Default for TcmuTargetBuilder {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            size_bytes: 0,
-            hba_index: 0,
-            loopback: false,
-            wwn: None,
-        }
-    }
 }
 
 impl TcmuTargetBuilder {
@@ -123,7 +112,7 @@ impl TcmuTargetBuilder {
         anyhow::ensure!(!self.name.is_empty(), "device name must not be empty");
         anyhow::ensure!(self.size_bytes > 0, "size_bytes must be > 0");
         anyhow::ensure!(
-            self.size_bytes % 512 == 0,
+            self.size_bytes.is_multiple_of(512),
             "size_bytes must be a multiple of 512"
         );
         TcmuTarget::create(self)
@@ -164,13 +153,16 @@ impl TcmuTarget {
         fs::create_dir_all(&device_configfs)
             .with_context(|| format!("creating {}", device_configfs.display()))?;
 
-        fs::write(device_configfs.join("dev_size"), cfg.size_bytes.to_string())
-            .context("writing dev_size")?;
+        fs::write(
+            device_configfs.join("attrib").join("dev_size"),
+            cfg.size_bytes.to_string(),
+        )
+        .context("writing dev_size")?;
 
         fs::write(device_configfs.join("enable"), "1").context("enabling device")?;
 
         // 2. Find the UIO device the kernel created (appears under /sys/class/uio/).
-        let uio_name = format!("tcm-user{}/{}", cfg.hba_index, cfg.name);
+        let uio_name = format!("tcm-user/{}/{}", cfg.hba_index, cfg.name);
         let uio_path = wait_for_uio(&uio_name, Duration::from_secs(5))
             .context("waiting for UIO device to appear")?;
 
@@ -221,7 +213,8 @@ impl Drop for TcmuTarget {
             let _ = fs::write(lb.tpgt_dir.join("enable"), "0");
             let _ = fs::remove_file(&lb.lun_symlink);
             let _ = fs::remove_dir(lb.tpgt_dir.join("lun").join("lun_0"));
-            let _ = fs::remove_dir(lb.tpgt_dir.join("lun"));
+            // The kernel does not allow removing the bare "lun/" group; skip it
+            // and remove tpgt_1 directly (which also tears down the nexus).
             let _ = fs::remove_dir(&lb.tpgt_dir);
             let _ = fs::remove_dir(&lb.wwn_dir);
         }
@@ -241,6 +234,10 @@ fn create_loopback(wwn: &str, device_configfs: &Path, name: &str) -> anyhow::Res
     fs::create_dir_all(&lun_dir)
         .with_context(|| format!("creating LUN directory {}", lun_dir.display()))?;
 
+    // Set the initiator port (nexus) so the kernel can associate an initiator
+    // with this target portal group and trigger SCSI host creation.
+    fs::write(tpgt_dir.join("nexus"), wwn).context("writing loopback nexus")?;
+
     std::os::unix::fs::symlink(device_configfs, &lun_symlink).with_context(|| {
         format!(
             "creating LUN symlink {} -> {}",
@@ -249,7 +246,9 @@ fn create_loopback(wwn: &str, device_configfs: &Path, name: &str) -> anyhow::Res
         )
     })?;
 
-    fs::write(tpgt_dir.join("enable"), "1").context("enabling tpgt")?;
+    // Some kernels require enabling the tpgt explicitly; ignore errors on
+    // kernels where this attribute doesn't exist (the tpgt is auto-active).
+    let _ = fs::write(tpgt_dir.join("enable"), "1");
 
     Ok(LoopbackPaths {
         wwn_dir,
@@ -264,10 +263,10 @@ fn wait_for_uio(expected_name: &str, timeout: Duration) -> anyhow::Result<PathBu
     loop {
         for entry in fs::read_dir("/sys/class/uio").context("reading /sys/class/uio")? {
             let entry = entry?;
-            if let Ok(name) = fs::read_to_string(entry.path().join("name")) {
-                if name.trim() == expected_name {
-                    return Ok(PathBuf::from("/dev").join(entry.file_name()));
-                }
+            if let Ok(name) = fs::read_to_string(entry.path().join("name"))
+                && name.trim() == expected_name
+            {
+                return Ok(PathBuf::from("/dev").join(entry.file_name()));
             }
         }
         if Instant::now() >= deadline {
@@ -329,11 +328,16 @@ const MB_CMD_TAIL: usize = 64;
 
 const ENTRY_LEN_OP: usize = 0;
 const ENTRY_IOV_CNT: usize = 8;
-const ENTRY_CDB_OFF: usize = 20;
-const ENTRY_IOVS: usize = 44;
+// The inner anonymous struct within the union is NOT __packed__, so the
+// compiler inserts 4 bytes of alignment padding before the u64 cdb_off field:
+//   hdr(8) | iov_cnt(4) | iov_bidi_cnt(4) | iov_dif_cnt(4) | pad(4) | cdb_off(8)
+const ENTRY_CDB_OFF: usize = 24;
+// iov[] follows __pad1(8) and __pad2(8) after cdb_off, so starts at offset 48.
+const ENTRY_IOVS: usize = 48;
 const ENTRY_RSP_STATUS: usize = 8;
-const ENTRY_RSP_SENSE_LEN: usize = 16;
-const ENTRY_RSP_SENSE_BUF: usize = 20;
+// In kernel ≥6.x, sense_buffer starts immediately after the 8-byte status/pad
+// header (scsi_status(1) + pad(1) + pad(2) + read_len(4) → offset 16).
+const ENTRY_RSP_SENSE_BUF: usize = 16;
 
 const IOV_BASE: usize = 0;
 const IOV_LEN: usize = 8;
@@ -404,7 +408,6 @@ fn run_event_loop<D: BlockDevice>(
     let cmdr_off = unsafe { ru32(base, MB_CMDR_OFF) } as usize;
     let cmdr_size = unsafe { ru32(base, MB_CMDR_SIZE) } as usize;
     let cmdr = unsafe { base.add(cmdr_off) };
-
     loop {
         // Poll with a 100 ms timeout so the stop flag is checked promptly.
         let mut pfd = libc::pollfd {
@@ -426,15 +429,13 @@ fn run_event_loop<D: BlockDevice>(
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        if ret == 0 {
-            continue; // timeout, no events
+        if ret > 0 {
+            // POLLIN: consume the interrupt counter so the next poll starts fresh.
+            let mut buf = [0u8; 4];
+            uio.read_exact(&mut buf)?;
         }
-
-        // POLLIN: consume the interrupt counter.
-        let mut buf = [0u8; 4];
-        uio.read_exact(&mut buf)?;
-
-        // Drain all pending entries.
+        // Drain all pending entries (including commands queued before the UIO
+        // file was opened, which don't generate a new POLLIN event).
         loop {
             let head = unsafe { rv32(base, MB_CMD_HEAD) } as usize;
             let tail = unsafe { rv32(base, MB_CMD_TAIL) } as usize;
@@ -444,8 +445,10 @@ fn run_event_loop<D: BlockDevice>(
 
             let entry = unsafe { cmdr.add(tail) };
             let len_op = unsafe { ru32(entry, ENTRY_LEN_OP) };
-            let opcode = len_op & 0x3;
-            let entry_len = (len_op >> 2) as usize;
+            // Low 3 bits are the opcode; remaining bits (already byte-aligned
+            // to TCMU_OP_ALIGN_SIZE=8) are the entry length in bytes.
+            let opcode = len_op & 0x7;
+            let entry_len = (len_op & !0x7) as usize;
 
             // PAD entry: ring wrapped around, restart from the beginning.
             if opcode == TCMU_OP_PAD {
@@ -463,8 +466,8 @@ fn run_event_loop<D: BlockDevice>(
             let cdb_off = unsafe { ru64(entry, ENTRY_CDB_OFF) } as usize;
             let cdb = unsafe { std::slice::from_raw_parts(base.add(cdb_off), 16) };
 
-            // For write commands (which we reject) the IOVs carry the
-            // initiator data; gather it so execute() can inspect it.
+            // For write commands the IOVs carry initiator data; gather it
+            // so execute() can inspect it.
             let iov_arr = unsafe { entry.add(ENTRY_IOVS) };
             let mut data_out = Vec::new();
             for i in 0..iov_cnt {
@@ -495,12 +498,11 @@ fn run_event_loop<D: BlockDevice>(
             // Write status and sense data back into the entry.
             unsafe {
                 entry.add(ENTRY_RSP_STATUS).write(response.status);
-                let sense_len = response.sense.len().min(TCMU_SENSE_BUFFERSIZE) as u32;
-                (entry.add(ENTRY_RSP_SENSE_LEN) as *mut u32).write_unaligned(sense_len);
+                let sense_len = response.sense.len().min(TCMU_SENSE_BUFFERSIZE);
                 std::ptr::copy_nonoverlapping(
                     response.sense.as_ptr(),
                     entry.add(ENTRY_RSP_SENSE_BUF),
-                    sense_len as usize,
+                    sense_len,
                 );
             }
 
