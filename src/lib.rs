@@ -1,7 +1,11 @@
-//! Generic SCSI/TCMU command processor for read-only user-space block devices.
+//! Generic SCSI/TCMU command processor for user-space block devices.
 //!
 //! Implement [`BlockDevice`] for your backing store, then wrap it in
 //! [`TcmuDevice`] to get a SCSI command executor suitable for use with TCMU.
+//!
+//! Devices are **read-only by default**: the default implementations of
+//! [`BlockDevice::is_read_only`] and [`BlockDevice::write_at`] report WRITE
+//! PROTECTED to the SCSI initiator.  Override both to enable writes.
 //!
 //! # Optional: Linux target management
 //!
@@ -41,29 +45,50 @@ const INQUIRY_VPD_UNIT_SERIAL: u8 = 0x80;
 const INQUIRY_VPD_DEVICE_ID: u8 = 0x83;
 const SENSE_FIXED_CURRENT: u8 = 0x70;
 const SENSE_KEY_NO_SENSE: u8 = 0x00;
+const SENSE_KEY_MEDIUM_ERROR: u8 = 0x03;
 const SENSE_KEY_ILLEGAL_REQUEST: u8 = 0x05;
 const SENSE_KEY_DATA_PROTECT: u8 = 0x07;
 const ASC_INVALID_OPCODE: u8 = 0x20;
+const ASC_INVALID_FIELD_IN_CDB: u8 = 0x24;
 const ASCQ_NONE: u8 = 0x00;
 const ASC_LBA_OUT_OF_RANGE: u8 = 0x21;
 const ASC_WRITE_PROTECTED: u8 = 0x27;
+const ASC_WRITE_ERROR: u8 = 0x0c;
 const SERVICE_ACTION_READ_CAPACITY_16: u8 = 0x10;
 const MODE_SENSE_PAGE_CODE_ALL: u8 = 0x3f;
 const MODE_SENSE_PAGE_CODE_CACHING: u8 = 0x08;
 
-/// A read-only user-space block device that can be exposed via TCMU.
+/// A user-space block device that can be exposed via TCMU.
 pub trait BlockDevice {
     /// Total size of the device in bytes.
     fn size_bytes(&self) -> u64;
 
-    /// Read `len` bytes starting at `offset`. Returns an error if the range
-    /// is out of bounds or the read fails.
+    /// Read `len` bytes starting at `offset`.
     fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<impl AsRef<[u8]>>;
 
     /// Opaque identifier bytes used to derive the SCSI serial number and
-    /// device identification VPD page. The bytes may be any length;
-    /// they are hex-encoded to produce a human-readable serial string.
+    /// device identification VPD page. Hex-encoded to produce the serial
+    /// string.
     fn id_bytes(&self) -> Vec<u8>;
+
+    /// Returns `true` if the device is read-only.
+    ///
+    /// When `true`, all WRITE commands return WRITE PROTECTED without calling
+    /// [`write_at`](Self::write_at). Override alongside `write_at` to enable
+    /// writes. Default: `true`.
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    /// Write `data` to the device at byte `offset`.
+    ///
+    /// Called only when [`is_read_only`](Self::is_read_only) returns `false`.
+    /// A failed write returns a MEDIUM ERROR sense to the initiator. The
+    /// default panics — always override this together with `is_read_only`.
+    fn write_at(&self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+        let _ = (offset, data);
+        panic!("write_at called on a device that did not override is_read_only");
+    }
 }
 
 /// Identity strings reported to the SCSI initiator via INQUIRY responses.
@@ -79,7 +104,7 @@ pub struct TcmuDeviceConfig {
     pub device_id_prefix: String,
 }
 
-/// Read-only TCMU-facing SCSI command processor backed by a [`BlockDevice`].
+/// TCMU-facing SCSI command processor backed by a [`BlockDevice`].
 pub struct TcmuDevice<D> {
     device: D,
     config: TcmuDeviceConfig,
@@ -101,7 +126,9 @@ impl<D: BlockDevice> TcmuDevice<D> {
 
     /// Execute a single SCSI CDB and return the resulting status, payload, and
     /// sense data.
-    pub fn execute(&self, cdb: &[u8], _data_out: &[u8]) -> TcmuResponse {
+    ///
+    /// `data_out` carries initiator data for WRITE commands.
+    pub fn execute(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
         if cdb.is_empty() {
             return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
         }
@@ -119,9 +146,12 @@ impl<D: BlockDevice> TcmuDevice<D> {
             READ_12 => self.read_12(cdb),
             READ_16 => self.read_16(cdb),
             SYNCHRONIZE_CACHE_10 | SYNCHRONIZE_CACHE_16 => good(Vec::new()),
-            WRITE_6 | WRITE_10 | WRITE_12 | WRITE_16 | WRITE_SAME_10 | WRITE_SAME_16 => {
-                check_condition(SENSE_KEY_DATA_PROTECT, ASC_WRITE_PROTECTED, ASCQ_NONE)
-            }
+            WRITE_6 => self.write_6(cdb, data_out),
+            WRITE_10 => self.write_10(cdb, data_out),
+            WRITE_12 => self.write_12(cdb, data_out),
+            WRITE_16 => self.write_16(cdb, data_out),
+            WRITE_SAME_10 => self.write_same_10(cdb, data_out),
+            WRITE_SAME_16 => self.write_same_16(cdb, data_out),
             _ => check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE),
         }
     }
@@ -249,7 +279,9 @@ impl<D: BlockDevice> TcmuDevice<D> {
         };
         let mut buf = vec![0_u8; 4 + page.len()];
         buf[0] = (buf.len() - 1) as u8;
-        buf[2] = 0x80;
+        if self.device.is_read_only() {
+            buf[2] = 0x80; // WP bit
+        }
         buf[4..].copy_from_slice(&page);
         good(truncate_to_alloc_len(buf, alloc_len))
     }
@@ -269,7 +301,9 @@ impl<D: BlockDevice> TcmuDevice<D> {
         let mut buf = vec![0_u8; 8 + page.len()];
         let mode_data_len = (buf.len() - 2) as u16;
         put_be_u16(&mut buf[0..2], mode_data_len);
-        buf[3] = 0x80;
+        if self.device.is_read_only() {
+            buf[3] = 0x80; // WP bit
+        }
         buf[8..].copy_from_slice(&page);
         good(truncate_to_alloc_len(buf, alloc_len))
     }
@@ -331,11 +365,126 @@ impl<D: BlockDevice> TcmuDevice<D> {
         {
             return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, ASCQ_NONE);
         }
-
         match self.device.read_at(offset, byte_len as usize) {
             Ok(bytes) => good(bytes.as_ref().to_vec()),
             Err(_) => check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, ASCQ_NONE),
         }
+    }
+
+    fn write_6(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
+        if cdb.len() < 6 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = u32::from(cdb[1] & 0x1f) << 16 | u32::from(cdb[2]) << 8 | u32::from(cdb[3]);
+        let transfer = if cdb[4] == 0 { 256 } else { u32::from(cdb[4]) };
+        self.write_blocks(u64::from(lba), transfer, data_out)
+    }
+
+    fn write_10(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
+        if cdb.len() < 10 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = u64::from(read_be_u32(&cdb[2..6]));
+        let transfer = u32::from(read_be_u16(&cdb[7..9]));
+        self.write_blocks(lba, transfer, data_out)
+    }
+
+    fn write_12(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
+        if cdb.len() < 12 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = u64::from(read_be_u32(&cdb[2..6]));
+        let transfer = read_be_u32(&cdb[6..10]);
+        self.write_blocks(lba, transfer, data_out)
+    }
+
+    fn write_16(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
+        if cdb.len() < 16 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = read_be_u64(&cdb[2..10]);
+        let transfer = read_be_u32(&cdb[10..14]);
+        self.write_blocks(lba, transfer, data_out)
+    }
+
+    fn write_blocks(&self, lba: u64, transfer_blocks: u32, data_out: &[u8]) -> TcmuResponse {
+        if self.device.is_read_only() {
+            return check_condition(SENSE_KEY_DATA_PROTECT, ASC_WRITE_PROTECTED, ASCQ_NONE);
+        }
+        let byte_len = u64::from(transfer_blocks) * u64::from(LOGICAL_BLOCK_SIZE);
+        let offset = lba * u64::from(LOGICAL_BLOCK_SIZE);
+        if offset
+            .checked_add(byte_len)
+            .is_none_or(|end| end > self.device.size_bytes())
+        {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, ASCQ_NONE);
+        }
+        if (data_out.len() as u64) < byte_len {
+            return check_condition(
+                SENSE_KEY_ILLEGAL_REQUEST,
+                ASC_INVALID_FIELD_IN_CDB,
+                ASCQ_NONE,
+            );
+        }
+        match self.device.write_at(offset, &data_out[..byte_len as usize]) {
+            Ok(()) => good(Vec::new()),
+            Err(_) => check_condition(SENSE_KEY_MEDIUM_ERROR, ASC_WRITE_ERROR, ASCQ_NONE),
+        }
+    }
+
+    fn write_same_10(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
+        if cdb.len() < 10 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = u64::from(read_be_u32(&cdb[2..6]));
+        let blocks = u64::from(read_be_u16(&cdb[7..9]));
+        // transfer == 0 means "write to end of device"
+        let count = if blocks == 0 {
+            self.logical_block_count().saturating_sub(lba)
+        } else {
+            blocks
+        };
+        self.write_same_blocks(lba, count, data_out)
+    }
+
+    fn write_same_16(&self, cdb: &[u8], data_out: &[u8]) -> TcmuResponse {
+        if cdb.len() < 16 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = read_be_u64(&cdb[2..10]);
+        let blocks = u64::from(read_be_u32(&cdb[10..14]));
+        let count = if blocks == 0 {
+            self.logical_block_count().saturating_sub(lba)
+        } else {
+            blocks
+        };
+        self.write_same_blocks(lba, count, data_out)
+    }
+
+    fn write_same_blocks(&self, lba: u64, count: u64, data_out: &[u8]) -> TcmuResponse {
+        if self.device.is_read_only() {
+            return check_condition(SENSE_KEY_DATA_PROTECT, ASC_WRITE_PROTECTED, ASCQ_NONE);
+        }
+        let bs = u64::from(LOGICAL_BLOCK_SIZE);
+        if lba
+            .checked_add(count)
+            .is_none_or(|end| end > self.logical_block_count())
+        {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, ASCQ_NONE);
+        }
+        // Use the first block of data_out as the pattern, or zeros if empty.
+        let pattern: Vec<u8> = if data_out.len() >= bs as usize {
+            data_out[..bs as usize].to_vec()
+        } else {
+            vec![0u8; bs as usize]
+        };
+        for i in 0..count {
+            let offset = (lba + i) * bs;
+            if self.device.write_at(offset, &pattern).is_err() {
+                return check_condition(SENSE_KEY_MEDIUM_ERROR, ASC_WRITE_ERROR, ASCQ_NONE);
+            }
+        }
+        good(Vec::new())
     }
 
     fn hex_serial(&self) -> String {
@@ -404,24 +553,25 @@ fn put_be_u64(dst: &mut [u8], value: u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
-    struct FlatDevice {
+    // ── Read-only device ──────────────────────────────────────────────────────
+
+    struct RoDevice {
         data: Vec<u8>,
         id: [u8; 4],
     }
 
-    impl FlatDevice {
+    impl RoDevice {
         fn new(data: Vec<u8>) -> Self {
-            let len = data.len() as u32;
-            Self {
-                data,
-                id: len.to_be_bytes(),
-            }
+            let id = (data.len() as u32).to_be_bytes();
+            Self { data, id }
         }
     }
 
-    impl BlockDevice for FlatDevice {
+    impl BlockDevice for RoDevice {
         fn size_bytes(&self) -> u64 {
             self.data.len() as u64
         }
@@ -433,9 +583,56 @@ mod tests {
         fn id_bytes(&self) -> Vec<u8> {
             self.id.to_vec()
         }
+        // is_read_only() defaults to true
     }
 
-    fn test_config() -> TcmuDeviceConfig {
+    // ── Read-write device ─────────────────────────────────────────────────────
+
+    struct RwDevice {
+        data: RefCell<Vec<u8>>,
+        id: [u8; 4],
+    }
+
+    impl RwDevice {
+        fn new(size_blocks: usize) -> Self {
+            let data = vec![0u8; size_blocks * LOGICAL_BLOCK_SIZE as usize];
+            let id = (size_blocks as u32).to_be_bytes();
+            Self {
+                data: RefCell::new(data),
+                id,
+            }
+        }
+    }
+
+    impl BlockDevice for RwDevice {
+        fn size_bytes(&self) -> u64 {
+            self.data.borrow().len() as u64
+        }
+
+        fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<impl AsRef<[u8]>> {
+            let data = self.data.borrow();
+            Ok(data[offset as usize..offset as usize + len].to_vec())
+        }
+
+        fn id_bytes(&self) -> Vec<u8> {
+            self.id.to_vec()
+        }
+
+        fn is_read_only(&self) -> bool {
+            false
+        }
+
+        fn write_at(&self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
+            let mut buf = self.data.borrow_mut();
+            let off = offset as usize;
+            buf[off..off + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn ro_config() -> TcmuDeviceConfig {
         TcmuDeviceConfig {
             vendor_id: *b"TESTVEN ",
             product_id: *b"TESTPROD        ",
@@ -444,24 +641,29 @@ mod tests {
         }
     }
 
-    fn make_device(size_blocks: usize) -> TcmuDevice<FlatDevice> {
+    fn ro_device(size_blocks: usize) -> TcmuDevice<RoDevice> {
         let data = vec![0xAB_u8; size_blocks * LOGICAL_BLOCK_SIZE as usize];
-        TcmuDevice::new(FlatDevice::new(data), test_config())
+        TcmuDevice::new(RoDevice::new(data), ro_config())
     }
+
+    fn rw_device(size_blocks: usize) -> TcmuDevice<RwDevice> {
+        TcmuDevice::new(RwDevice::new(size_blocks), ro_config())
+    }
+
+    // ── Read-only tests ───────────────────────────────────────────────────────
 
     #[test]
     fn inquiry_reports_configured_vendor_and_product() {
-        let dev = make_device(4);
+        let dev = ro_device(4);
         let resp = dev.execute(&[INQUIRY, 0, 0, 0, 36, 0], &[]);
         assert_eq!(resp.status, SAM_STAT_GOOD);
-        assert_eq!(resp.data[0], 0x00);
         assert_eq!(&resp.data[8..16], b"TESTVEN ");
         assert_eq!(&resp.data[16..32], b"TESTPROD        ");
     }
 
     #[test]
     fn read_capacity_matches_block_count() {
-        let dev = make_device(8);
+        let dev = ro_device(8);
         let resp = dev.execute(&[READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[]);
         assert_eq!(resp.status, SAM_STAT_GOOD);
         let last_lba = read_be_u32(&resp.data[0..4]) as u64;
@@ -472,7 +674,7 @@ mod tests {
 
     #[test]
     fn read_10_returns_correct_data() {
-        let dev = make_device(4);
+        let dev = ro_device(4);
         let mut cdb = [0_u8; 10];
         cdb[0] = READ_10;
         put_be_u32(&mut cdb[2..6], 0);
@@ -484,22 +686,92 @@ mod tests {
     }
 
     #[test]
-    fn write_commands_are_rejected() {
-        let dev = make_device(4);
-        let resp = dev.execute(&[WRITE_10, 0, 0, 0, 0, 0, 0, 0, 1, 0], &[]);
+    fn write_rejected_on_read_only_device() {
+        let dev = ro_device(4);
+        let resp = dev.execute(&[WRITE_10, 0, 0, 0, 0, 0, 0, 0, 1, 0], &[0u8; 512]);
         assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
         assert_eq!(resp.sense[2], SENSE_KEY_DATA_PROTECT);
         assert_eq!(resp.sense[12], ASC_WRITE_PROTECTED);
     }
 
     #[test]
+    fn mode_sense_sets_wp_bit_for_read_only_device() {
+        let dev = ro_device(4);
+        let resp = dev.execute(&[MODE_SENSE_6, 0, MODE_SENSE_PAGE_CODE_ALL, 0, 255, 0], &[]);
+        assert_eq!(resp.status, SAM_STAT_GOOD);
+        assert_eq!(resp.data[2] & 0x80, 0x80, "WP bit should be set");
+    }
+
+    #[test]
     fn out_of_range_read_returns_check_condition() {
-        let dev = make_device(2);
+        let dev = ro_device(2);
         let mut cdb = [0_u8; 10];
         cdb[0] = READ_10;
         put_be_u32(&mut cdb[2..6], 100);
         put_be_u16(&mut cdb[7..9], 1);
         let resp = dev.execute(&cdb, &[]);
+        assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
+        assert_eq!(resp.sense[2], SENSE_KEY_ILLEGAL_REQUEST);
+        assert_eq!(resp.sense[12], ASC_LBA_OUT_OF_RANGE);
+    }
+
+    // ── Read-write tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn write_10_and_read_back() {
+        let dev = rw_device(4);
+        let payload = vec![0xBE_u8; LOGICAL_BLOCK_SIZE as usize];
+        let mut cdb = [0_u8; 10];
+        cdb[0] = WRITE_10;
+        put_be_u32(&mut cdb[2..6], 2); // LBA 2
+        put_be_u16(&mut cdb[7..9], 1);
+        let resp = dev.execute(&cdb, &payload);
+        assert_eq!(resp.status, SAM_STAT_GOOD);
+
+        cdb[0] = READ_10;
+        let resp = dev.execute(&cdb, &[]);
+        assert_eq!(resp.status, SAM_STAT_GOOD);
+        assert!(resp.data.iter().all(|&b| b == 0xBE));
+    }
+
+    #[test]
+    fn write_same_fills_blocks() {
+        let dev = rw_device(4);
+        let pattern = vec![0xCC_u8; LOGICAL_BLOCK_SIZE as usize];
+        let mut cdb = [0_u8; 10];
+        cdb[0] = WRITE_SAME_10;
+        put_be_u32(&mut cdb[2..6], 0);
+        put_be_u16(&mut cdb[7..9], 4); // all 4 blocks
+        let resp = dev.execute(&cdb, &pattern);
+        assert_eq!(resp.status, SAM_STAT_GOOD);
+
+        // Verify every block has the pattern.
+        for lba in 0u32..4 {
+            cdb[0] = READ_10;
+            put_be_u32(&mut cdb[2..6], lba);
+            put_be_u16(&mut cdb[7..9], 1);
+            let resp = dev.execute(&cdb, &[]);
+            assert_eq!(resp.status, SAM_STAT_GOOD);
+            assert!(resp.data.iter().all(|&b| b == 0xCC), "LBA {lba} mismatch");
+        }
+    }
+
+    #[test]
+    fn mode_sense_clears_wp_bit_for_writable_device() {
+        let dev = rw_device(4);
+        let resp = dev.execute(&[MODE_SENSE_6, 0, MODE_SENSE_PAGE_CODE_ALL, 0, 255, 0], &[]);
+        assert_eq!(resp.status, SAM_STAT_GOOD);
+        assert_eq!(resp.data[2] & 0x80, 0x00, "WP bit should be clear");
+    }
+
+    #[test]
+    fn out_of_range_write_returns_check_condition() {
+        let dev = rw_device(2);
+        let mut cdb = [0_u8; 10];
+        cdb[0] = WRITE_10;
+        put_be_u32(&mut cdb[2..6], 100);
+        put_be_u16(&mut cdb[7..9], 1);
+        let resp = dev.execute(&cdb, &vec![0u8; 512]);
         assert_eq!(resp.status, SAM_STAT_CHECK_CONDITION);
         assert_eq!(resp.sense[2], SENSE_KEY_ILLEGAL_REQUEST);
         assert_eq!(resp.sense[12], ASC_LBA_OUT_OF_RANGE);
