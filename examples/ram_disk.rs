@@ -19,7 +19,7 @@ struct RamDisk {
 impl RamDisk {
     fn new(data: Vec<u8>) -> Self {
         assert!(
-            data.len() % 512 == 0,
+            data.len().is_multiple_of(512),
             "RamDisk size must be a multiple of 512 bytes"
         );
         // Use the first 8 bytes of the data as a simple stable id.
@@ -51,7 +51,7 @@ fn main() {
     // Build a 4-sector (2 KiB) disk filled with a recognizable pattern.
     let mut contents = Vec::with_capacity(4 * 512);
     for sector in 0u8..4 {
-        contents.extend(std::iter::repeat(sector).take(512));
+        contents.extend(std::iter::repeat_n(sector, 512));
     }
 
     let device = TcmuDevice::new(

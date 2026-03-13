@@ -58,7 +58,10 @@ fn main() -> anyhow::Result<()> {
             let file = OpenOptions::new().read(true).open(path)?;
             let meta = file.metadata()?;
             let size = meta.len();
-            anyhow::ensure!(size % 512 == 0, "image size {size} is not a multiple of 512");
+            anyhow::ensure!(
+                size % 512 == 0,
+                "image size {size} is not a multiple of 512"
+            );
             let mut id = [0u8; 8];
             id.copy_from_slice(&meta.ino().to_be_bytes());
             Ok(Self { file, size, id })

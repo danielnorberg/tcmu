@@ -44,7 +44,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{fence, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -121,7 +122,10 @@ impl TcmuTargetBuilder {
     pub fn build(self) -> anyhow::Result<TcmuTarget> {
         anyhow::ensure!(!self.name.is_empty(), "device name must not be empty");
         anyhow::ensure!(self.size_bytes > 0, "size_bytes must be > 0");
-        anyhow::ensure!(self.size_bytes % 512 == 0, "size_bytes must be a multiple of 512");
+        anyhow::ensure!(
+            self.size_bytes % 512 == 0,
+            "size_bytes must be a multiple of 512"
+        );
         TcmuTarget::create(self)
     }
 }
@@ -135,6 +139,7 @@ pub struct TcmuTarget {
     device_configfs: PathBuf,
     uio_path: PathBuf,
     loopback: Option<LoopbackPaths>,
+    stop: Arc<AtomicBool>,
 }
 
 struct LoopbackPaths {
@@ -180,7 +185,12 @@ impl TcmuTarget {
             None
         };
 
-        Ok(Self { device_configfs, uio_path, loopback })
+        Ok(Self {
+            device_configfs,
+            uio_path,
+            loopback,
+            stop: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Path to the UIO character device (e.g. `/dev/uio0`).
@@ -188,12 +198,19 @@ impl TcmuTarget {
         &self.uio_path
     }
 
+    /// Signal the event loop started by [`run`](Self::run) to return cleanly.
+    ///
+    /// Safe to call from any thread. [`run`] will return `Ok(())` within 100 ms.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
     /// Run the blocking SCSI command loop.
     ///
     /// Returns only on I/O error (e.g. the UIO device was destroyed). The
     /// configfs target remains active until this [`TcmuTarget`] is dropped.
     pub fn run<D: BlockDevice>(&self, device: &TcmuDevice<D>) -> anyhow::Result<()> {
-        run_event_loop(&self.uio_path, device)
+        run_event_loop(&self.uio_path, device, &self.stop)
     }
 }
 
@@ -215,11 +232,7 @@ impl Drop for TcmuTarget {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn create_loopback(
-    wwn: &str,
-    device_configfs: &Path,
-    name: &str,
-) -> anyhow::Result<LoopbackPaths> {
+fn create_loopback(wwn: &str, device_configfs: &Path, name: &str) -> anyhow::Result<LoopbackPaths> {
     let wwn_dir = PathBuf::from(CONFIGFS).join("loopback").join(wwn);
     let tpgt_dir = wwn_dir.join("tpgt_1");
     let lun_dir = tpgt_dir.join("lun").join("lun_0");
@@ -238,7 +251,11 @@ fn create_loopback(
 
     fs::write(tpgt_dir.join("enable"), "1").context("enabling tpgt")?;
 
-    Ok(LoopbackPaths { wwn_dir, tpgt_dir, lun_symlink })
+    Ok(LoopbackPaths {
+        wwn_dir,
+        tpgt_dir,
+        lun_symlink,
+    })
 }
 
 /// Poll `/sys/class/uio/` until a device whose `name` file matches appears.
@@ -354,7 +371,11 @@ fn uio_mmap_size(uio_path: &Path) -> anyhow::Result<usize> {
     Ok(usize::from_str_radix(hex, 16)?)
 }
 
-fn run_event_loop<D: BlockDevice>(uio_path: &Path, device: &TcmuDevice<D>) -> anyhow::Result<()> {
+fn run_event_loop<D: BlockDevice>(
+    uio_path: &Path,
+    device: &TcmuDevice<D>,
+    stop: &AtomicBool,
+) -> anyhow::Result<()> {
     let mut uio = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -385,7 +406,31 @@ fn run_event_loop<D: BlockDevice>(uio_path: &Path, device: &TcmuDevice<D>) -> an
     let cmdr = unsafe { base.add(cmdr_off) };
 
     loop {
-        // Block until the kernel signals at least one new command.
+        // Poll with a 100 ms timeout so the stop flag is checked promptly.
+        let mut pfd = libc::pollfd {
+            fd: uio.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 100) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                continue;
+            }
+            return Err(err.into());
+        }
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if ret == 0 {
+            continue; // timeout, no events
+        }
+
+        // POLLIN: consume the interrupt counter.
         let mut buf = [0u8; 4];
         uio.read_exact(&mut buf)?;
 
@@ -426,7 +471,8 @@ fn run_event_loop<D: BlockDevice>(uio_path: &Path, device: &TcmuDevice<D>) -> an
                 let iov = unsafe { iov_arr.add(i * IOV_STRIDE) };
                 let off = unsafe { ru64(iov, IOV_BASE) } as usize;
                 let len = unsafe { ru64(iov, IOV_LEN) } as usize;
-                data_out.extend_from_slice(unsafe { std::slice::from_raw_parts(base.add(off), len) });
+                data_out
+                    .extend_from_slice(unsafe { std::slice::from_raw_parts(base.add(off), len) });
             }
 
             let response = device.execute(cdb, &data_out);
