@@ -66,6 +66,7 @@ pub struct TcmuTargetBuilder {
     loopback: bool,
     wwn: Option<String>,
     read_ahead_kb: Option<u32>,
+    hw_max_sectors: Option<u32>,
 }
 
 impl TcmuTargetBuilder {
@@ -113,6 +114,20 @@ impl TcmuTargetBuilder {
     /// If not set, the kernel default (typically 128 KiB) is used.
     pub fn read_ahead_kb(mut self, kb: u32) -> Self {
         self.read_ahead_kb = Some(kb);
+        self
+    }
+
+    /// Maximum transfer size in 512-byte sectors for a single SCSI command.
+    ///
+    /// Written to the TCMU `control` file (as `hw_max_sectors=N`) before the
+    /// device is enabled. The kernel default is 128 sectors (64 KiB). Higher
+    /// values allow the kernel to send larger SCSI READ/WRITE commands,
+    /// reducing per-command overhead.
+    ///
+    /// The practical upper bound is constrained by the TCMU data area size
+    /// (`max_data_area_mb`, default 1024 MiB).
+    pub fn hw_max_sectors(mut self, sectors: u32) -> Self {
+        self.hw_max_sectors = Some(sectors);
         self
     }
 
@@ -183,6 +198,14 @@ impl TcmuTarget {
             cfg.size_bytes.to_string(),
         )
         .context("writing dev_size")?;
+
+        if let Some(sectors) = cfg.hw_max_sectors {
+            fs::write(
+                device_configfs.join("control"),
+                format!("hw_max_sectors={sectors}"),
+            )
+            .context("writing hw_max_sectors to control")?;
+        }
 
         fs::write(device_configfs.join("enable"), "1").context("enabling device")?;
 

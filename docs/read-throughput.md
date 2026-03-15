@@ -97,24 +97,44 @@ with ~4000 commands per 4 GiB pass. At 3.87 GiB/s, per-command overhead is
 2. **Parallel command dispatch.** A thread pool for READ I/O could overlap
    backend reads. Requires careful ring tail management.
 
-3. **Kernel-side improvements.** The TCMU `hw_max_sectors` (128 sectors = 64
-   KiB) is read-only and set by the kernel module. A kernel patch to raise it
-   would allow larger SCSI transfers.
+3. **Larger `hw_max_sectors`.** Now configurable via
+   `TcmuTargetBuilder::hw_max_sectors()`. Didn't help on this local loopback
+   workload (kernel readahead caps at ~2 MiB I/Os), but may improve
+   throughput on iSCSI or other fabrics.
 
 4. **Raw block benchmark.** Add a raw sequential read benchmark (no ext4)
    to isolate transport overhead from filesystem caching behavior.
 
-## Queue Tuning Reference
+## Tuning Reference
 
-The benchmark applies these sysfs settings after the block device appears:
+### TCMU configfs (before device enable)
+
+`hw_max_sectors` controls the maximum SCSI transfer size in 512-byte sectors.
+The kernel default is 128 (64 KiB). It must be set via the configfs `control`
+file before the device is enabled — the `attrib/hw_max_sectors` file is
+read-only.
+
+```rust
+TcmuTarget::builder()
+    .name("mydev")
+    .size_bytes(size)
+    .hw_max_sectors(8192) // 4 MiB
+    .with_loopback()
+    .build()?;
+```
+
+On this workload, raising `hw_max_sectors` did not improve throughput because
+the kernel readahead algorithm caps individual I/O submissions at ~2 MiB
+regardless. It may matter more on iSCSI or other fabrics where the SCSI-level
+limit is the effective cap.
+
+### Block device sysfs (after device appears)
 
 ```sh
 echo none > /sys/block/sdX/queue/scheduler
 echo 16384 > /sys/block/sdX/queue/max_sectors_kb
 echo 8192 > /sys/block/sdX/queue/read_ahead_kb
 ```
-
-Public helpers are available in `tcmu::target`:
 
 ```rust
 tcmu::target::set_scheduler(&block_dev, "none")?;

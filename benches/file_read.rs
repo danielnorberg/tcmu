@@ -150,6 +150,7 @@ impl BenchEnv {
             TcmuTarget::builder()
                 .name(&target_name)
                 .size_bytes(size)
+                .hw_max_sectors(8192) // 4 MiB (default 128 = 64 KiB)
                 .with_loopback()
                 .build()?,
         );
