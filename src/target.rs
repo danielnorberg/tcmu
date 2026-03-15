@@ -65,6 +65,7 @@ pub struct TcmuTargetBuilder {
     hba_index: u32,
     loopback: bool,
     wwn: Option<String>,
+    read_ahead_kb: Option<u32>,
 }
 
 impl TcmuTargetBuilder {
@@ -103,6 +104,15 @@ impl TcmuTargetBuilder {
     /// If not set, a deterministic WWN is derived from the device name.
     pub fn wwn(mut self, wwn: impl Into<String>) -> Self {
         self.wwn = Some(wwn.into());
+        self
+    }
+
+    /// Set `read_ahead_kb` on the block device queue after the loopback
+    /// device appears. Only meaningful with [`with_loopback`](Self::with_loopback).
+    ///
+    /// If not set, the kernel default (typically 128 KiB) is used.
+    pub fn read_ahead_kb(mut self, kb: u32) -> Self {
+        self.read_ahead_kb = Some(kb);
         self
     }
 
@@ -460,6 +470,36 @@ fn command_has_data_in(opcode: u8) -> bool {
     )
 }
 
+/// Set `read_ahead_kb` on a block device queue via sysfs.
+///
+/// `block_dev` is the device path (e.g. `/dev/sda`). The device must
+/// already exist.
+pub fn set_read_ahead_kb(block_dev: &Path, kb: u32) -> anyhow::Result<()> {
+    set_block_queue_param(block_dev, "read_ahead_kb", &kb.to_string())
+}
+
+/// Set `max_sectors_kb` on a block device queue via sysfs.
+pub fn set_max_sectors_kb(block_dev: &Path, kb: u32) -> anyhow::Result<()> {
+    set_block_queue_param(block_dev, "max_sectors_kb", &kb.to_string())
+}
+
+/// Set the I/O scheduler on a block device via sysfs.
+///
+/// Common values: `"none"`, `"mq-deadline"`, `"kyber"`, `"bfq"`.
+pub fn set_scheduler(block_dev: &Path, scheduler: &str) -> anyhow::Result<()> {
+    set_block_queue_param(block_dev, "scheduler", scheduler)
+}
+
+fn set_block_queue_param(block_dev: &Path, param: &str, value: &str) -> anyhow::Result<()> {
+    let dev_name = block_dev
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid block device path: {}", block_dev.display()))?;
+    let path = format!("/sys/block/{dev_name}/queue/{param}");
+    fs::write(&path, value).with_context(|| format!("writing {value} to {path}"))?;
+    Ok(())
+}
+
 #[inline]
 unsafe fn ru32(base: *const u8, off: usize) -> u32 {
     unsafe { (base.add(off) as *const u32).read_unaligned() }
@@ -477,8 +517,10 @@ unsafe fn rv32(base: *const u8, off: usize) -> u32 {
 
 #[inline]
 unsafe fn wv32(base: *mut u8, off: usize, val: u32) {
+    // Release fence: all prior stores (response data, sense buffer) must be
+    // visible before the tail pointer update becomes visible to the kernel.
+    fence(Ordering::Release);
     unsafe { (base.add(off) as *mut u32).write_volatile(val) };
-    fence(Ordering::SeqCst);
 }
 
 fn uio_mmap_size(uio_path: &Path) -> anyhow::Result<usize> {
@@ -540,18 +582,18 @@ fn run_event_loop<D: BlockDevice>(
         loopback_rx = Some(rx);
     }
 
-    let result = loop {
+    let result = 'outer: loop {
         if let Some(rx) = loopback_rx.as_ref() {
             match rx.try_recv() {
                 Ok(Ok(())) => loopback_rx = None,
                 Ok(Err(err)) => {
                     stop.store(true, Ordering::Release);
-                    break Err(err);
+                    break 'outer Err(err);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     stop.store(true, Ordering::Release);
-                    break Err(anyhow::anyhow!("loopback setup thread disconnected"));
+                    break 'outer Err(anyhow::anyhow!("loopback setup thread disconnected"));
                 }
             }
         }
@@ -567,22 +609,22 @@ fn run_event_loop<D: BlockDevice>(
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
                 if stop.load(Ordering::Acquire) {
-                    break Ok(());
+                    break 'outer Ok(());
                 }
                 continue;
             }
             stop.store(true, Ordering::Release);
-            break Err(err.into());
+            break 'outer Err(err.into());
         }
         if stop.load(Ordering::Acquire) {
-            break Ok(());
+            break 'outer Ok(());
         }
         if ret > 0 {
             // POLLIN: consume the interrupt counter so the next poll starts fresh.
             let mut buf = [0u8; 4];
             if let Err(err) = uio.read_exact(&mut buf) {
                 stop.store(true, Ordering::Release);
-                break Err(err.into());
+                break 'outer Err(err.into());
             }
         }
         // Drain all pending entries (including commands queued before the UIO
@@ -683,7 +725,7 @@ fn run_event_loop<D: BlockDevice>(
         // Notify the kernel that cmd_tail has moved.
         if let Err(err) = uio.write_all(&1u32.to_ne_bytes()) {
             stop.store(true, Ordering::Release);
-            break Err(err.into());
+            break 'outer Err(err.into());
         }
     };
 

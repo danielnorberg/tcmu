@@ -767,6 +767,51 @@ fn sense_data(sense_key: u8, asc: u8, ascq: u8) -> Vec<u8> {
     sense
 }
 
+/// Read exactly the combined length of `bufs` from file descriptor `fd` at
+/// `offset` using a single `preadv(2)` syscall.
+///
+/// This is a convenience for [`BlockDevice::read_exact_vectored_at`]
+/// implementors backed by a file descriptor. It avoids issuing one `pread64`
+/// per iovec.
+#[cfg(all(target_os = "linux", feature = "linux-target"))]
+pub fn preadv_exact(
+    fd: std::os::unix::io::RawFd,
+    offset: u64,
+    bufs: &mut [&mut [u8]],
+) -> anyhow::Result<()> {
+    let iovecs: Vec<libc::iovec> = bufs
+        .iter_mut()
+        .map(|buf| libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        })
+        .collect();
+    let total_len: usize = bufs.iter().map(|b| b.len()).sum();
+    loop {
+        let ret = unsafe {
+            libc::preadv(
+                fd,
+                iovecs.as_ptr(),
+                iovecs.len() as libc::c_int,
+                offset as libc::off_t,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        anyhow::ensure!(
+            ret as usize == total_len,
+            "preadv: short read ({} of {total_len} bytes)",
+            ret,
+        );
+        return Ok(());
+    }
+}
+
 fn truncate_to_alloc_len(mut data: Vec<u8>, alloc_len: usize) -> Vec<u8> {
     data.truncate(alloc_len.min(data.len()));
     data

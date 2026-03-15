@@ -66,12 +66,8 @@ mod test {
             offset: u64,
             bufs: &mut [&mut [u8]],
         ) -> anyhow::Result<()> {
-            let mut off = offset;
-            for buf in bufs {
-                self.file.read_exact_at(buf, off)?;
-                off += buf.len() as u64;
-            }
-            Ok(())
+            use std::os::unix::io::AsRawFd;
+            tcmu::preadv_exact(self.file.as_raw_fd(), offset, bufs)
         }
 
         fn id_bytes(&self) -> Vec<u8> {

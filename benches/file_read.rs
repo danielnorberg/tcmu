@@ -2,7 +2,6 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -46,12 +45,19 @@ fn run_benchmarks(c: &mut Criterion, env: &BenchEnv) {
     large_file.measurement_time(Duration::from_secs(10));
     large_file.sampling_mode(SamplingMode::Flat);
     large_file.throughput(Throughput::Bytes(LARGE_FILE_SIZE as u64));
-    large_file.bench_function(BenchmarkId::new("tcmu", "single_pass"), |b| {
-        bench_single_pass(b, env, Transport::Tcmu, read_large_file)
-    });
+
     large_file.bench_function(BenchmarkId::new("loop", "single_pass"), |b| {
         bench_single_pass(b, env, Transport::Loop, read_large_file)
     });
+
+    for ra_kb in [128, 2048, 8192, 16384] {
+        tcmu::target::set_read_ahead_kb(&env.tcmu_block_dev, ra_kb).unwrap();
+        large_file.bench_function(
+            BenchmarkId::new(format!("tcmu/ra_{ra_kb}k"), "single_pass"),
+            |b| bench_single_pass(b, env, Transport::Tcmu, read_large_file),
+        );
+    }
+
     large_file.finish();
 }
 
@@ -135,7 +141,7 @@ impl BenchEnv {
         populate_fixture(&populate_mount)?;
         cmd("umount", &[populate_mount.to_str().unwrap()])?;
 
-        let file_device = RwFileDevice::open(&image_path)?;
+        let file_device = MmapDevice::open(&image_path)?;
         let size = file_device.size_bytes();
         let target_name = format!("file-read-bench-{}", std::process::id());
         let before_devices = tcm_loop_block_devices();
@@ -163,6 +169,11 @@ impl BenchEnv {
         let loop_thread = std::thread::spawn(move || target_t.run(&*device_t));
 
         let tcmu_block_dev = wait_for_new_tcm_loop_device(&before_devices, Duration::from_secs(5))?;
+
+        // Tune the block device queue for throughput.
+        tcmu::target::set_scheduler(&tcmu_block_dev, "none")?;
+        tcmu::target::set_max_sectors_kb(&tcmu_block_dev, 16384)?;
+
         let loop_block_dev = attach_loop_device(&image_path)?;
 
         let tcmu_mount = tempdir.path().join("mnt_tcmu");
@@ -236,48 +247,70 @@ impl Drop for BenchEnv {
     }
 }
 
-#[derive(Clone)]
-struct RwFileDevice {
-    file: Arc<std::fs::File>,
+struct MmapDevice {
+    ptr: *const u8,
     size: u64,
     id: [u8; 8],
 }
 
-impl RwFileDevice {
+unsafe impl Send for MmapDevice {}
+unsafe impl Sync for MmapDevice {}
+
+impl MmapDevice {
     fn open(path: &Path) -> anyhow::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file = OpenOptions::new().read(true).open(path)?;
         let size = file.metadata()?.len();
         anyhow::ensure!(size > 0 && size % 512 == 0, "image size {size} unusable");
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size as libc::size_t,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_POPULATE,
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        anyhow::ensure!(ptr != libc::MAP_FAILED, "mmap failed");
+        unsafe { libc::madvise(ptr, size as libc::size_t, libc::MADV_HUGEPAGE) };
+        unsafe { libc::madvise(ptr, size as libc::size_t, libc::MADV_SEQUENTIAL) };
         let id = size.to_be_bytes();
         Ok(Self {
-            file: Arc::new(file),
+            ptr: ptr as *const u8,
             size,
             id,
         })
     }
 }
 
-impl BlockDevice for RwFileDevice {
+impl Drop for MmapDevice {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.size as libc::size_t) };
+    }
+}
+
+impl BlockDevice for MmapDevice {
     fn size_bytes(&self) -> u64 {
         self.size
     }
 
     fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<impl AsRef<[u8]>> {
-        let mut buf = vec![0u8; len];
-        self.file.read_exact_at(&mut buf, offset)?;
-        Ok(buf)
+        let src = unsafe { std::slice::from_raw_parts(self.ptr.add(offset as usize), len) };
+        Ok(src.to_vec())
     }
 
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
-        self.file.read_exact_at(buf, offset)?;
+        let src = unsafe { std::slice::from_raw_parts(self.ptr.add(offset as usize), buf.len()) };
+        buf.copy_from_slice(src);
         Ok(())
     }
 
     fn read_exact_vectored_at(&self, offset: u64, bufs: &mut [&mut [u8]]) -> anyhow::Result<()> {
-        let mut off = offset;
+        let mut off = offset as usize;
         for buf in bufs {
-            self.file.read_exact_at(buf, off)?;
-            off += buf.len() as u64;
+            let src = unsafe { std::slice::from_raw_parts(self.ptr.add(off), buf.len()) };
+            buf.copy_from_slice(src);
+            off += buf.len();
         }
         Ok(())
     }
@@ -287,24 +320,7 @@ impl BlockDevice for RwFileDevice {
     }
 
     fn is_read_only(&self) -> bool {
-        false
-    }
-
-    fn write_at(&self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
-        let mut off = offset;
-        let mut remaining = data;
-        while !remaining.is_empty() {
-            match self.file.write_at(remaining, off) {
-                Ok(0) => anyhow::bail!("write_at returned 0"),
-                Ok(n) => {
-                    remaining = &remaining[n..];
-                    off += n as u64;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
+        true
     }
 }
 
