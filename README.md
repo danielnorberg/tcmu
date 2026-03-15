@@ -151,12 +151,17 @@ It benchmarks two workloads:
 - Reading a 4 GiB large file (`large_file/{tcmu,loop}`)
 - Reading many small files (`small_files/{tcmu,loop}`)
 
-Build, then run the binary as root (since TCMU requires configfs and device
-setup):
+Run on Linux as root (TCMU requires configfs and device setup):
 
 ```sh
-cargo bench --features linux-target --bench file_read --no-run
-sudo $(ls target/release/deps/file_read-* | grep -v '\\.') --bench --noplot
+make bench
+```
+
+Or to run a specific workload:
+
+```sh
+make bench-large
+make bench-small
 ```
 
 The benchmark prepares one ext4 image, populates it once, keeps the backing

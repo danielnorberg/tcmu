@@ -125,8 +125,8 @@ tcmu::target::set_read_ahead_kb(&block_dev, 8192)?;
 ## Validation Commands
 
 ```sh
-cargo test --features linux-target
-cargo clippy --all-targets --all-features -- -D warnings
-cargo bench --features linux-target --bench file_read --no-run
-sudo $(ls target/release/deps/file_read-* | grep -v '\\.') --bench --noplot
+make test
+make clippy
+make bench
+make bench-large   # large_file workload only
 ```
