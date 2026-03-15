@@ -64,7 +64,6 @@ pub struct TcmuTargetBuilder {
     size_bytes: u64,
     hba_index: u32,
     loopback: bool,
-    wwn: Option<String>,
     read_ahead_kb: Option<u32>,
     hw_max_sectors: Option<u32>,
     cmd_time_out: Option<Duration>,
@@ -101,13 +100,6 @@ impl TcmuTargetBuilder {
         self
     }
 
-    /// Override the auto-generated WWN used for the loopback fabric.
-    ///
-    /// If not set, a deterministic WWN is derived from the device name.
-    pub fn wwn(mut self, wwn: impl Into<String>) -> Self {
-        self.wwn = Some(wwn.into());
-        self
-    }
 
     /// Set `read_ahead_kb` on the block device queue after the loopback
     /// device appears. Only meaningful with [`with_loopback`](Self::with_loopback).
@@ -245,7 +237,7 @@ impl TcmuTarget {
         // 3. Optionally remember loopback config to be activated by run().
         let loopback_cfg = if cfg.loopback {
             Some(LoopbackConfig {
-                wwn: cfg.wwn.unwrap_or_else(|| derive_wwn(&cfg.name)),
+                wwn: derive_wwn(&cfg.name),
                 name: cfg.name,
             })
         } else {
