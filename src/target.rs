@@ -478,6 +478,153 @@ fn derive_wwn(name: &str) -> String {
     format!("naa.6{hash:015x}")
 }
 
+// ─── Orphan detection and cleanup ─────────────────────────────────────────
+
+/// A TCMU device discovered via configfs enumeration.
+#[derive(Debug, Clone)]
+pub struct TcmuDeviceInfo {
+    /// Device name as it appears in configfs (e.g. `"mydev-12345"`).
+    pub name: String,
+    /// HBA index (the `N` in `user_N`).
+    pub hba_index: u32,
+    /// PID of the process that has the UIO fd open, if any.
+    /// `None` means no handler is running — the device is orphaned.
+    pub handler_pid: Option<u32>,
+    /// The configfs device directory path.
+    pub configfs_path: PathBuf,
+}
+
+/// Enumerate all TCMU devices on the system.
+///
+/// Scans configfs for devices under `user_0`, `user_1`, etc. and checks
+/// whether each device has an active handler (UIO fd open by a process).
+///
+/// Useful for reconciliation: compare the returned list against your
+/// expected set of devices, and call [`cleanup_device`] on any orphans.
+pub fn list_devices() -> Vec<TcmuDeviceInfo> {
+    let mut devices = Vec::new();
+    let core_dir = PathBuf::from(CONFIGFS).join("core");
+    let Ok(rd) = fs::read_dir(&core_dir) else {
+        return devices;
+    };
+    for hba_entry in rd.flatten() {
+        let hba_name = hba_entry.file_name().to_string_lossy().to_string();
+        let Some(idx_str) = hba_name.strip_prefix("user_") else {
+            continue;
+        };
+        let Ok(hba_index) = idx_str.parse::<u32>() else {
+            continue;
+        };
+        let Ok(dev_rd) = fs::read_dir(hba_entry.path()) else {
+            continue;
+        };
+        for dev_entry in dev_rd.flatten() {
+            let name = dev_entry.file_name().to_string_lossy().to_string();
+            if name == "hba_info" || name == "hba_mode" {
+                continue;
+            }
+            let handler_pid = find_handler_pid(hba_index, &name);
+            devices.push(TcmuDeviceInfo {
+                name,
+                hba_index,
+                handler_pid,
+                configfs_path: dev_entry.path(),
+            });
+        }
+    }
+    devices
+}
+
+/// Clean up an orphaned TCMU device and its loopback fabric.
+///
+/// Performs `reset_ring` to force-complete stuck commands, deletes the SCSI
+/// device, removes the loopback fabric, and removes the configfs device
+/// directory.
+///
+/// Safe to call on any device, but intended for devices whose handler has
+/// died (i.e. [`TcmuDeviceInfo::handler_pid`] is `None`).
+pub fn cleanup_device(info: &TcmuDeviceInfo) {
+    let dev = &info.configfs_path;
+
+    // 1. Force-complete all in-flight commands.
+    let _ = fs::write(dev.join("action").join("reset_ring"), "2");
+
+    // 2. Find and clean up loopback fabric if it exists.
+    let wwn = derive_wwn(&info.name);
+    let tpgt_dir = PathBuf::from(CONFIGFS)
+        .join("loopback")
+        .join(&wwn)
+        .join("tpgt_1");
+
+    if tpgt_dir.exists() {
+        // Delete SCSI device via targeted path.
+        if let Ok(addr) = fs::read_to_string(tpgt_dir.join("address")) {
+            delete_scsi_device(addr.trim());
+        }
+
+        // Remove LUN symlink.
+        let lun_dir = tpgt_dir.join("lun").join("lun_0");
+        if let Ok(rd) = fs::read_dir(&lun_dir) {
+            for entry in rd.flatten() {
+                if entry.file_type().is_ok_and(|ft| ft.is_symlink()) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        let _ = fs::remove_dir(&lun_dir);
+        let _ = fs::remove_dir(&tpgt_dir);
+        let _ = fs::remove_dir(
+            PathBuf::from(CONFIGFS).join("loopback").join(&wwn),
+        );
+    }
+
+    // 3. Remove the TCMU device.
+    let _ = fs::remove_dir(dev);
+}
+
+/// Find the PID of the process holding the UIO fd for a TCMU device.
+fn find_handler_pid(hba_index: u32, name: &str) -> Option<u32> {
+    let expected = format!("tcm-user/{hba_index}/{name}");
+    let Ok(rd) = fs::read_dir("/sys/class/uio") else {
+        return None;
+    };
+    for entry in rd.flatten() {
+        if let Ok(uio_name) = fs::read_to_string(entry.path().join("name"))
+            && uio_name.trim() == expected
+        {
+            // Found the UIO device. Check who has it open via /dev/uioN.
+            let uio_dev = PathBuf::from("/dev").join(entry.file_name());
+            return find_pid_with_fd_open(&uio_dev);
+        }
+    }
+    None
+}
+
+/// Find a PID that has the given path open as a file descriptor.
+fn find_pid_with_fd_open(path: &Path) -> Option<u32> {
+    let Ok(rd) = fs::read_dir("/proc") else {
+        return None;
+    };
+    for entry in rd.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let fd_dir = entry.path().join("fd");
+        let Ok(fds) = fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd_entry in fds.flatten() {
+            if let Ok(target) = fs::read_link(fd_entry.path())
+                && target == path
+            {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
 // ─── UIO event loop ───────────────────────────────────────────────────────────
 //
 // Shared memory layout (from <linux/target_core_user.h>, all __packed):

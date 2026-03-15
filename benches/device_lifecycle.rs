@@ -167,6 +167,30 @@ fn main() {
         return;
     }
 
+    // List all TCMU devices and their handler status.
+    if args.get(1).is_some_and(|a| a == "--list") {
+        for dev in tcmu::target::list_devices() {
+            eprintln!("  {} (hba={}) handler={:?}",
+                dev.name, dev.hba_index,
+                dev.handler_pid.map(|p| p.to_string()).unwrap_or_else(|| "NONE".into()));
+        }
+        return;
+    }
+
+    // Clean up all orphaned devices (no handler PID).
+    if args.get(1).is_some_and(|a| a == "--cleanup") {
+        let devices = tcmu::target::list_devices();
+        let orphans: Vec<_> = devices.iter().filter(|d| d.handler_pid.is_none()).collect();
+        if orphans.is_empty() {
+            eprintln!("no orphaned devices");
+        }
+        for dev in &orphans {
+            eprintln!("cleaning up orphan: {}", dev.name);
+            tcmu::target::cleanup_device(dev);
+        }
+        return;
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))
         .expect("register SIGINT");
