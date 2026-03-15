@@ -271,6 +271,29 @@ impl TcmuTarget {
         self.stop.store(true, Ordering::Release);
     }
 
+    /// Tear down the loopback fabric while the event loop is still running,
+    /// then signal the event loop to stop.
+    ///
+    /// This is the preferred shutdown sequence: removing the LUN while the
+    /// handler is alive lets the kernel's SCSI teardown commands (INQUIRY,
+    /// TEST UNIT READY) be serviced normally, avoiding 30-second SCSI
+    /// command timeouts during device removal.
+    ///
+    /// After calling this, join the event loop thread and then drop the
+    /// target.
+    pub fn shutdown(&self) {
+        if let Ok(mut loopback) = self.loopback.lock()
+            && let Some(lb) = loopback.take()
+        {
+            let _ = fs::write(lb.tpgt_dir.join("enable"), "0");
+            let _ = fs::remove_file(&lb.lun_symlink);
+            let _ = fs::remove_dir(lb.tpgt_dir.join("lun").join("lun_0"));
+            let _ = fs::remove_dir(&lb.tpgt_dir);
+            let _ = fs::remove_dir(&lb.wwn_dir);
+        }
+        self.stop.store(true, Ordering::Release);
+    }
+
     /// Run the blocking SCSI command loop.
     ///
     /// Returns only on I/O error (e.g. the UIO device was destroyed). The
@@ -293,11 +316,18 @@ impl TcmuTarget {
 impl Drop for TcmuTarget {
     fn drop(&mut self) {
         // Best-effort — ignore individual errors so drop never panics.
-
-        // Force-complete any in-flight commands so that LUN teardown does not
-        // block on lun_ref draining. This is critical when the event loop has
-        // already exited (handler crash or normal shutdown) — without it, the
-        // kernel waits for SCSI commands that will never be completed.
+        //
+        // Teardown order matters:
+        //
+        // 1. reset_ring — force-complete any in-flight TCMU commands so the
+        //    kernel's lun_ref count can drain. Without this, the LUN unlink
+        //    in step 2 blocks forever if the event loop has already exited.
+        //
+        // 2. Remove loopback fabric — the kernel sends SCSI commands during
+        //    removal (INQUIRY, etc.). If the event loop is still running it
+        //    services them; if not, reset_ring already cleared the decks.
+        //
+        // 3. Remove the TCMU device configfs directory.
         let _ = fs::write(
             self.device_configfs.join("action").join("reset_ring"),
             "2",
@@ -309,13 +339,10 @@ impl Drop for TcmuTarget {
             let _ = fs::write(lb.tpgt_dir.join("enable"), "0");
             let _ = fs::remove_file(&lb.lun_symlink);
             let _ = fs::remove_dir(lb.tpgt_dir.join("lun").join("lun_0"));
-            // The kernel does not allow removing the bare "lun/" group; skip it
-            // and remove tpgt_1 directly (which also tears down the nexus).
             let _ = fs::remove_dir(&lb.tpgt_dir);
             let _ = fs::remove_dir(&lb.wwn_dir);
         }
-        // For LIO backstores, `enable` is write-once: only `"1"` is accepted.
-        // Removal of the configfs device directory performs teardown.
+
         let _ = fs::remove_dir(&self.device_configfs);
     }
 }
