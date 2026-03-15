@@ -28,4 +28,5 @@ required-features = ["linux-target"]
 [[bench]]
 name = "device_lifecycle"
 harness = false
+test = false
 required-features = ["linux-target"]
