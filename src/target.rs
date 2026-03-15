@@ -193,6 +193,9 @@ struct LoopbackPaths {
     wwn_dir: PathBuf,
     tpgt_dir: PathBuf,
     lun_symlink: PathBuf,
+    /// SCSI address from `tpgt_1/address`, e.g. `"0:0:1"` → host0, channel 0,
+    /// target 1. The LUN is always 0 (we create exactly one LUN per tpgt).
+    scsi_address: Option<String>,
 }
 
 impl TcmuTarget {
@@ -285,6 +288,13 @@ impl TcmuTarget {
         if let Ok(mut loopback) = self.loopback.lock()
             && let Some(lb) = loopback.take()
         {
+            // Delete the SCSI device first — this is O(1) and removes the
+            // block device immediately, rather than relying on the host-wide
+            // removal path triggered by configfs teardown (which is slow when
+            // many other devices exist).
+            if let Some(addr) = &lb.scsi_address {
+                delete_scsi_device(addr);
+            }
             let _ = fs::write(lb.tpgt_dir.join("enable"), "0");
             let _ = fs::remove_file(&lb.lun_symlink);
             let _ = fs::remove_dir(lb.tpgt_dir.join("lun").join("lun_0"));
@@ -365,12 +375,16 @@ impl LoopbackStarter {
 
         let paths = create_loopback(&self.cfg.wwn, &self.device_configfs, &self.cfg.name)
             .context("creating loopback fabric")?;
+
+        // Trigger a targeted SCSI scan on just the host and target assigned to
+        // this device, instead of rescanning every tcm_loop host (which is
+        // O(N) in existing devices).
+        if let Some(addr) = &paths.scsi_address {
+            scan_scsi_address(addr);
+        }
+
         *loopback = Some(paths);
         drop(loopback);
-
-        if wait_for_tcm_loop_host(Duration::from_secs(5), &stop) {
-            rescan_tcm_loop_hosts();
-        }
         Ok(())
     }
 }
@@ -402,52 +416,45 @@ fn create_loopback(wwn: &str, device_configfs: &Path, name: &str) -> anyhow::Res
     // kernels where this attribute doesn't exist (the tpgt is auto-active).
     let _ = fs::write(tpgt_dir.join("enable"), "1");
 
+    // Read the SCSI address assigned by the kernel (e.g. "0:0:1" for
+    // host0, channel 0, target 1). Used for targeted scan and deletion.
+    let scsi_address = fs::read_to_string(tpgt_dir.join("address"))
+        .ok()
+        .map(|s| s.trim().to_string());
+
     Ok(LoopbackPaths {
         wwn_dir,
         tpgt_dir,
         lun_symlink,
+        scsi_address,
     })
 }
 
-/// Trigger a rescan on all tcm_loop SCSI hosts so the newly created loopback
-/// target is discovered immediately.
-fn rescan_tcm_loop_hosts() {
-    let Ok(rd) = fs::read_dir("/sys/class/scsi_host") else {
+/// Trigger a targeted SCSI scan for a specific host:channel:target address.
+///
+/// `address` is the `H:C:T` string from `tpgt_1/address` (e.g. `"0:0:1"`).
+/// Writes `"C T 0"` to `/sys/class/scsi_host/host{H}/scan` so only this
+/// one LUN is probed — O(1) instead of the O(N) full-host rescan.
+fn scan_scsi_address(address: &str) {
+    let parts: Vec<&str> = address.split(':').collect();
+    if parts.len() != 3 {
         return;
-    };
-    for entry in rd.flatten() {
-        let proc_name_path = entry.path().join("proc_name");
-        if let Ok(name) = fs::read_to_string(&proc_name_path)
-            && (name.trim() == "tcm_loop" || name.trim() == "tcm_loopback")
-        {
-            let _ = fs::write(entry.path().join("scan"), "- - -");
-        }
     }
+    let (host, channel, target) = (parts[0], parts[1], parts[2]);
+    let scan_path = format!("/sys/class/scsi_host/host{host}/scan");
+    let _ = fs::write(&scan_path, format!("{channel} {target} 0"));
 }
 
-fn wait_for_tcm_loop_host(timeout: Duration, stop: &AtomicBool) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return false;
-        }
-        let Ok(rd) = fs::read_dir("/sys/class/scsi_host") else {
-            return false;
-        };
-        for entry in rd.flatten() {
-            let proc_name_path = entry.path().join("proc_name");
-            if let Ok(name) = fs::read_to_string(&proc_name_path)
-                && (name.trim() == "tcm_loop" || name.trim() == "tcm_loopback")
-            {
-                return true;
-            }
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// Delete a specific SCSI device by its H:C:T address (LUN 0).
+///
+/// Writes `1` to `/sys/class/scsi_device/H:C:T:0/device/delete`. This is
+/// much faster than relying on the host-wide removal path during loopback
+/// teardown, especially when many other devices exist on the system.
+fn delete_scsi_device(address: &str) {
+    let delete_path = format!("/sys/class/scsi_device/{address}:0/device/delete");
+    let _ = fs::write(&delete_path, "1");
 }
+
 
 /// Poll `/sys/class/uio/` until a device whose `name` file matches appears.
 fn wait_for_uio(expected_name: &str, timeout: Duration) -> anyhow::Result<PathBuf> {
