@@ -359,26 +359,134 @@ fn main() {
     if !stop.load(Ordering::Relaxed) {
         eprintln!("sustained_sequential: running for 30s...");
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut count = 0u64;
+        let mut samples = Vec::new();
         let start = Instant::now();
         while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
             let name = next_name();
             let before = tcm_loop_block_devices();
+            let t = Instant::now();
             match create_one_loopback(&name, &before, &stop) {
                 Ok((target, handle, dev)) => {
                     teardown(target, handle);
                     wait_for_device_removal(&dev, Duration::from_secs(5), &stop);
-                    count += 1;
+                    samples.push(t.elapsed());
                 }
                 Err(e) => {
-                    eprintln!("  sustained error after {count}: {e:#}");
+                    eprintln!("  sustained error after {}: {e:#}", samples.len());
                     break;
                 }
             }
         }
         let elapsed = start.elapsed();
-        let rate = count as f64 / elapsed.as_secs_f64();
-        eprintln!("sustained_sequential                     count={count}  elapsed={:.1}s  rate={rate:.1}/s",
+        let rate = samples.len() as f64 / elapsed.as_secs_f64();
+        let avg = if samples.is_empty() { 0.0 } else {
+            samples.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>() / samples.len() as f64
+        };
+        eprintln!("sustained_sequential                     count={:<4} elapsed={:.1}s  rate={rate:.1}/s  avg={avg:.0}ms",
+            samples.len(), elapsed.as_secs_f64());
+    }
+
+    // 6. Sustained concurrent throughput (30 seconds, batches of 8)
+    if !stop.load(Ordering::Relaxed) {
+        let batch = 8;
+        eprintln!("sustained_concurrent/{batch}: running for 30s...");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut total_devices = 0u64;
+        let mut batch_times = Vec::new();
+        let start = Instant::now();
+        while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+            let before = tcm_loop_block_devices();
+            let t = Instant::now();
+            let handles: Vec<_> = (0..batch)
+                .map(|_| {
+                    let name = next_name();
+                    let before = before.clone();
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || create_one_loopback(&name, &before, &stop))
+                })
+                .collect();
+            let mut targets = Vec::new();
+            let mut ok = true;
+            for h in handles {
+                match h.join().unwrap() {
+                    Ok(t) => targets.push(t),
+                    Err(e) => { eprintln!("  concurrent error: {e:#}"); ok = false; break; }
+                }
+            }
+            let batch_wall = t.elapsed();
+            let devs: Vec<_> = targets.iter().map(|(_, _, d)| d.clone()).collect();
+            for (target, handle, _) in targets {
+                teardown(target, handle);
+            }
+            for dev in &devs {
+                wait_for_device_removal(dev, Duration::from_secs(5), &stop);
+            }
+            if ok {
+                total_devices += batch as u64;
+                batch_times.push(batch_wall);
+            } else {
+                break;
+            }
+        }
+        let elapsed = start.elapsed();
+        let rate = total_devices as f64 / elapsed.as_secs_f64();
+        let avg_batch = if batch_times.is_empty() { 0.0 } else {
+            batch_times.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>() / batch_times.len() as f64
+        };
+        eprintln!("sustained_concurrent/{batch}                    count={total_devices:<4} elapsed={:.1}s  rate={rate:.1}/s  avg_batch={avg_batch:.0}ms",
+            elapsed.as_secs_f64());
+    }
+
+    // 7. Sustained multi-process throughput (30 seconds, batches of 8)
+    if !stop.load(Ordering::Relaxed) {
+        let batch = 8;
+        eprintln!("sustained_multiprocess/{batch}: running for 30s...");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut total_devices = 0u64;
+        let mut batch_times = Vec::new();
+        let start = Instant::now();
+        while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+            let t = Instant::now();
+            let mut children: Vec<std::process::Child> = (0..batch)
+                .map(|_| {
+                    let name = next_name();
+                    std::process::Command::new(&self_exe)
+                        .args(["--child", &name])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .expect("spawn child")
+                })
+                .collect();
+            let mut ok = true;
+            for child in &mut children {
+                let stdout = child.stdout.as_mut().unwrap();
+                let mut line = String::new();
+                use std::io::BufRead;
+                if std::io::BufReader::new(stdout).read_line(&mut line).is_err() {
+                    ok = false;
+                }
+            }
+            let batch_wall = t.elapsed();
+            for child in &mut children {
+                send_sigterm(child);
+            }
+            for child in &mut children {
+                let _ = child.wait();
+            }
+            if ok {
+                total_devices += batch as u64;
+                batch_times.push(batch_wall);
+            } else {
+                break;
+            }
+        }
+        let elapsed = start.elapsed();
+        let rate = total_devices as f64 / elapsed.as_secs_f64();
+        let avg_batch = if batch_times.is_empty() { 0.0 } else {
+            batch_times.iter().map(|d| d.as_secs_f64() * 1000.0).sum::<f64>() / batch_times.len() as f64
+        };
+        eprintln!("sustained_multiprocess/{batch}                  count={total_devices:<4} elapsed={:.1}s  rate={rate:.1}/s  avg_batch={avg_batch:.0}ms",
             elapsed.as_secs_f64());
     }
 
