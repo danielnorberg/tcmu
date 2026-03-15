@@ -160,3 +160,6 @@ The benchmark prepares one ext4 image, populates it once, keeps the backing
 image warm in the host cache, and then measures single-pass read throughput by
 mounting each transport read-only, reading the workload once, and unmounting
 before the next sample.
+
+Current findings and follow-up directions for large-file read throughput are
+tracked in [`docs/read-throughput.md`](docs/read-throughput.md).

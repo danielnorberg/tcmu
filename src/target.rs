@@ -453,6 +453,13 @@ fn command_has_data_out(opcode: u8) -> bool {
     )
 }
 
+fn command_has_data_in(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        crate::READ_6 | crate::READ_10 | crate::READ_12 | crate::READ_16
+    )
+}
+
 #[inline]
 unsafe fn ru32(base: *const u8, off: usize) -> u32 {
     unsafe { (base.add(off) as *const u32).read_unaligned() }
@@ -629,7 +636,18 @@ fn run_event_loop<D: BlockDevice>(
                 Vec::new()
             };
 
-            let response = device.execute(cdb, &data_out);
+            let response = if command_has_data_in(cdb[0]) {
+                let mut data_in = Vec::with_capacity(iov_cnt);
+                for i in 0..iov_cnt {
+                    let iov = unsafe { iov_arr.add(i * IOV_STRIDE) };
+                    let off = unsafe { ru64(iov, IOV_BASE) } as usize;
+                    let len = unsafe { ru64(iov, IOV_LEN) } as usize;
+                    data_in.push(unsafe { std::slice::from_raw_parts_mut(base.add(off), len) });
+                }
+                device.execute_into(cdb, &data_out, &mut data_in)
+            } else {
+                device.execute(cdb, &data_out)
+            };
 
             // For successful reads, scatter response data into the IOV buffers.
             if response.status == 0x00 && !response.data.is_empty() {

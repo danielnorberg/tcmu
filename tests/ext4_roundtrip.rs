@@ -56,6 +56,24 @@ mod test {
             Ok(buf)
         }
 
+        fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+            self.file.read_exact_at(buf, offset)?;
+            Ok(())
+        }
+
+        fn read_exact_vectored_at(
+            &self,
+            offset: u64,
+            bufs: &mut [&mut [u8]],
+        ) -> anyhow::Result<()> {
+            let mut off = offset;
+            for buf in bufs {
+                self.file.read_exact_at(buf, off)?;
+                off += buf.len() as u64;
+            }
+            Ok(())
+        }
+
         fn id_bytes(&self) -> Vec<u8> {
             self.id.to_vec()
         }

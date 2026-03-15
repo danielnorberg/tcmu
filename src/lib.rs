@@ -71,6 +71,52 @@ pub trait BlockDevice {
     /// Read `len` bytes starting at `offset`.
     fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<impl AsRef<[u8]>>;
 
+    /// Read exactly `buf.len()` bytes starting at `offset` into `buf`.
+    ///
+    /// Override this to avoid an intermediate allocation on the read path.
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        let bytes = self.read_at(offset, buf.len())?;
+        let bytes = bytes.as_ref();
+        anyhow::ensure!(
+            bytes.len() == buf.len(),
+            "short read: expected {} bytes, got {}",
+            buf.len(),
+            bytes.len()
+        );
+        buf.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Read exactly the combined length of `bufs` starting at `offset`.
+    ///
+    /// The default implementation uses [`read_exact_at`](Self::read_exact_at)
+    /// for a single buffer and falls back to one allocated `read_at` plus a
+    /// scatter copy for multiple buffers.
+    fn read_exact_vectored_at(&self, offset: u64, bufs: &mut [&mut [u8]]) -> anyhow::Result<()> {
+        match bufs {
+            [] => Ok(()),
+            [buf] => self.read_exact_at(offset, buf),
+            _ => {
+                let total_len = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+                let bytes = self.read_at(offset, total_len)?;
+                let bytes = bytes.as_ref();
+                anyhow::ensure!(
+                    bytes.len() == total_len,
+                    "short read: expected {} bytes, got {}",
+                    total_len,
+                    bytes.len()
+                );
+                let mut src = bytes;
+                for buf in bufs {
+                    let (head, tail) = src.split_at(buf.len());
+                    buf.copy_from_slice(head);
+                    src = tail;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Opaque identifier bytes used to derive the SCSI serial number and
     /// device identification VPD page. Hex-encoded to produce the serial
     /// string.
@@ -160,6 +206,25 @@ impl<D: BlockDevice> TcmuDevice<D> {
             WRITE_SAME_10 => self.write_same_10(cdb, data_out),
             WRITE_SAME_16 => self.write_same_16(cdb, data_out),
             _ => check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE),
+        }
+    }
+
+    pub(crate) fn execute_into(
+        &self,
+        cdb: &[u8],
+        data_out: &[u8],
+        data_in: &mut [&mut [u8]],
+    ) -> TcmuResponse {
+        if cdb.is_empty() {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+
+        match cdb[0] {
+            READ_6 => self.read_6_into(cdb, data_in),
+            READ_10 => self.read_10_into(cdb, data_in),
+            READ_12 => self.read_12_into(cdb, data_in),
+            READ_16 => self.read_16_into(cdb, data_in),
+            _ => self.execute(cdb, data_out),
         }
     }
 
@@ -433,6 +498,15 @@ impl<D: BlockDevice> TcmuDevice<D> {
         self.read_blocks(u64::from(lba), transfer)
     }
 
+    fn read_6_into(&self, cdb: &[u8], data_in: &mut [&mut [u8]]) -> TcmuResponse {
+        if cdb.len() < 6 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = u32::from(cdb[1] & 0x1f) << 16 | u32::from(cdb[2]) << 8 | u32::from(cdb[3]);
+        let transfer = if cdb[4] == 0 { 256 } else { u32::from(cdb[4]) };
+        self.read_blocks_into(u64::from(lba), transfer, data_in)
+    }
+
     fn read_10(&self, cdb: &[u8]) -> TcmuResponse {
         if cdb.len() < 10 {
             return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
@@ -440,6 +514,15 @@ impl<D: BlockDevice> TcmuDevice<D> {
         let lba = u64::from(read_be_u32(&cdb[2..6]));
         let transfer = u32::from(read_be_u16(&cdb[7..9]));
         self.read_blocks(lba, transfer)
+    }
+
+    fn read_10_into(&self, cdb: &[u8], data_in: &mut [&mut [u8]]) -> TcmuResponse {
+        if cdb.len() < 10 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = u64::from(read_be_u32(&cdb[2..6]));
+        let transfer = u32::from(read_be_u16(&cdb[7..9]));
+        self.read_blocks_into(lba, transfer, data_in)
     }
 
     fn read_12(&self, cdb: &[u8]) -> TcmuResponse {
@@ -451,6 +534,15 @@ impl<D: BlockDevice> TcmuDevice<D> {
         self.read_blocks(lba, transfer)
     }
 
+    fn read_12_into(&self, cdb: &[u8], data_in: &mut [&mut [u8]]) -> TcmuResponse {
+        if cdb.len() < 12 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = u64::from(read_be_u32(&cdb[2..6]));
+        let transfer = read_be_u32(&cdb[6..10]);
+        self.read_blocks_into(lba, transfer, data_in)
+    }
+
     fn read_16(&self, cdb: &[u8]) -> TcmuResponse {
         if cdb.len() < 16 {
             return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
@@ -458,6 +550,15 @@ impl<D: BlockDevice> TcmuDevice<D> {
         let lba = read_be_u64(&cdb[2..10]);
         let transfer = read_be_u32(&cdb[10..14]);
         self.read_blocks(lba, transfer)
+    }
+
+    fn read_16_into(&self, cdb: &[u8], data_in: &mut [&mut [u8]]) -> TcmuResponse {
+        if cdb.len() < 16 {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_INVALID_OPCODE, ASCQ_NONE);
+        }
+        let lba = read_be_u64(&cdb[2..10]);
+        let transfer = read_be_u32(&cdb[10..14]);
+        self.read_blocks_into(lba, transfer, data_in)
     }
 
     fn read_blocks(&self, lba: u64, transfer_blocks: u32) -> TcmuResponse {
@@ -469,9 +570,33 @@ impl<D: BlockDevice> TcmuDevice<D> {
         {
             return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, ASCQ_NONE);
         }
-        match self.device.read_at(offset, byte_len as usize) {
-            Ok(bytes) if bytes.as_ref().len() == byte_len as usize => good(bytes.as_ref().to_vec()),
-            Ok(_) | Err(_) => check_condition(SENSE_KEY_MEDIUM_ERROR, ASC_READ_ERROR, ASCQ_NONE),
+        let mut buf = vec![0u8; byte_len as usize];
+        match self.device.read_exact_at(offset, &mut buf) {
+            Ok(()) => good(buf),
+            Err(_) => check_condition(SENSE_KEY_MEDIUM_ERROR, ASC_READ_ERROR, ASCQ_NONE),
+        }
+    }
+
+    fn read_blocks_into(
+        &self,
+        lba: u64,
+        transfer_blocks: u32,
+        data_in: &mut [&mut [u8]],
+    ) -> TcmuResponse {
+        let byte_len = u64::from(transfer_blocks) * u64::from(LOGICAL_BLOCK_SIZE);
+        let offset = lba * u64::from(LOGICAL_BLOCK_SIZE);
+        if offset
+            .checked_add(byte_len)
+            .is_none_or(|end| end > self.device.size_bytes())
+        {
+            return check_condition(SENSE_KEY_ILLEGAL_REQUEST, ASC_LBA_OUT_OF_RANGE, ASCQ_NONE);
+        }
+        if data_in.iter().map(|buf| buf.len()).sum::<usize>() != byte_len as usize {
+            return check_condition(SENSE_KEY_MEDIUM_ERROR, ASC_READ_ERROR, ASCQ_NONE);
+        }
+        match self.device.read_exact_vectored_at(offset, data_in) {
+            Ok(()) => good(Vec::new()),
+            Err(_) => check_condition(SENSE_KEY_MEDIUM_ERROR, ASC_READ_ERROR, ASCQ_NONE),
         }
     }
 
@@ -876,6 +1001,25 @@ mod tests {
         assert_eq!(resp.status, SAM_STAT_GOOD);
         assert_eq!(resp.data.len(), LOGICAL_BLOCK_SIZE as usize);
         assert!(resp.data.iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn read_exact_at_default_copies_backend_bytes() {
+        let device = RoDevice::new((0..32).collect());
+        let mut buf = [0u8; 8];
+        device.read_exact_at(4, &mut buf).unwrap();
+        assert_eq!(&buf, &[4, 5, 6, 7, 8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn read_exact_vectored_at_default_scatters_backend_bytes() {
+        let device = RoDevice::new((0..32).collect());
+        let mut left = [0u8; 3];
+        let mut right = [0u8; 5];
+        let mut bufs: [&mut [u8]; 2] = [&mut left, &mut right];
+        device.read_exact_vectored_at(7, &mut bufs).unwrap();
+        assert_eq!(&left, &[7, 8, 9]);
+        assert_eq!(&right, &[10, 11, 12, 13, 14]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use tcmu::target::TcmuTarget;
 use tcmu::{BlockDevice, TcmuDevice, TcmuDeviceConfig};
 
@@ -43,7 +43,8 @@ fn run_benchmarks(c: &mut Criterion, env: &BenchEnv) {
     small_files.finish();
 
     let mut large_file = c.benchmark_group("large_file");
-    large_file.measurement_time(Duration::from_secs(70));
+    large_file.measurement_time(Duration::from_secs(10));
+    large_file.sampling_mode(SamplingMode::Flat);
     large_file.throughput(Throughput::Bytes(LARGE_FILE_SIZE as u64));
     large_file.bench_function(BenchmarkId::new("tcmu", "single_pass"), |b| {
         bench_single_pass(b, env, Transport::Tcmu, read_large_file)
@@ -265,6 +266,20 @@ impl BlockDevice for RwFileDevice {
         let mut buf = vec![0u8; len];
         self.file.read_exact_at(&mut buf, offset)?;
         Ok(buf)
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.file.read_exact_at(buf, offset)?;
+        Ok(())
+    }
+
+    fn read_exact_vectored_at(&self, offset: u64, bufs: &mut [&mut [u8]]) -> anyhow::Result<()> {
+        let mut off = offset;
+        for buf in bufs {
+            self.file.read_exact_at(buf, off)?;
+            off += buf.len() as u64;
+        }
+        Ok(())
     }
 
     fn id_bytes(&self) -> Vec<u8> {
