@@ -139,9 +139,11 @@ impl TcmuTargetBuilder {
     /// this duration and the kernel completes them with CHECK CONDITION,
     /// allowing cleanup to proceed.
     ///
-    /// **Cannot be changed after LUN exports exist.** Defaults to 10 seconds.
-    /// Setting to zero disables timeouts entirely — handler crashes become
-    /// unrecoverable without `reset_ring`.
+    /// **Cannot be changed after LUN exports exist.** Defaults to 30 seconds
+    /// (matching the kernel default). Must be longer than your slowest
+    /// expected backend I/O — the kernel aborts any command that exceeds
+    /// this timeout. Setting to zero disables timeouts entirely — handler
+    /// crashes become unrecoverable without `reset_ring`.
     pub fn cmd_time_out(mut self, timeout: Duration) -> Self {
         self.cmd_time_out = Some(timeout);
         self
@@ -226,7 +228,7 @@ impl TcmuTarget {
             .context("writing hw_max_sectors to control")?;
         }
 
-        let timeout = cfg.cmd_time_out.unwrap_or(Duration::from_secs(10));
+        let timeout = cfg.cmd_time_out.unwrap_or(Duration::from_secs(30));
         fs::write(
             device_configfs.join("control"),
             format!("cmd_time_out={}", timeout.as_secs()),
