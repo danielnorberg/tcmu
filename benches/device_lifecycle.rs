@@ -186,7 +186,7 @@ fn main() {
     }
 
     // 3. Concurrent
-    for n in [4, 8] {
+    for n in [4, 8, 16, 32, 64] {
         if stop.load(Ordering::Relaxed) { break; }
         let before = tcm_loop_block_devices();
         let start = Instant::now();
@@ -222,6 +222,33 @@ fn main() {
                 wall.as_secs_f64() * 1000.0,
                 wall.as_secs_f64() * 1000.0 / n as f64);
         }
+    }
+
+    // 4. Sustained sequential throughput (30 seconds)
+    if !stop.load(Ordering::Relaxed) {
+        eprintln!("sustained_sequential: running for 30s...");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut count = 0u64;
+        let start = Instant::now();
+        while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+            let name = next_name();
+            let before = tcm_loop_block_devices();
+            match create_one_loopback(&name, &before, &stop) {
+                Ok((target, handle, dev)) => {
+                    teardown(target, handle);
+                    wait_for_device_removal(&dev, Duration::from_secs(5), &stop);
+                    count += 1;
+                }
+                Err(e) => {
+                    eprintln!("  sustained error after {count}: {e:#}");
+                    break;
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        let rate = count as f64 / elapsed.as_secs_f64();
+        eprintln!("sustained_sequential                     count={count}  elapsed={:.1}s  rate={rate:.1}/s",
+            elapsed.as_secs_f64());
     }
 
     eprintln!();
