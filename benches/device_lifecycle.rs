@@ -123,10 +123,43 @@ fn print_stats(name: &str, samples: &[Duration]) {
     eprintln!("{name:<40} n={n:<3} mean={mean:>8.1}ms  p50={p50:>8.1}ms  min={min:>8.1}ms  max={max:>8.1}ms");
 }
 
+/// Child process: create one loopback device, print creation time, then
+/// wait for SIGTERM before tearing down.
+fn run_child(name: &str) {
+    let stop = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))
+        .expect("register SIGTERM");
+
+    let before = tcm_loop_block_devices();
+    let start = Instant::now();
+    let (target, handle, _dev) = create_one_loopback(name, &before, &stop)
+        .expect("child create failed");
+    let created = start.elapsed();
+
+    // Print creation time to stdout so the parent can parse it.
+    println!("{}", created.as_nanos());
+
+    // Wait for SIGTERM from parent.
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    teardown(target, handle);
+}
+
 fn main() {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("must run as root");
         std::process::exit(1);
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+
+    // Child process mode: create one device, print timing to stdout, wait for SIGTERM.
+    if args.get(1).is_some_and(|a| a == "--child") {
+        let name = args.get(2).expect("--child requires a device name");
+        run_child(name);
+        return;
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -134,6 +167,8 @@ fn main() {
         .expect("register SIGINT");
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))
         .expect("register SIGTERM");
+
+    let self_exe = std::env::current_exe().expect("current_exe");
 
     eprintln!();
 
@@ -224,7 +259,58 @@ fn main() {
         }
     }
 
-    // 4. Sustained sequential throughput (30 seconds)
+    // 4. Multi-process concurrent creation (simulates separate processes)
+    for n in [4, 8, 16, 32] {
+        if stop.load(Ordering::Relaxed) { break; }
+        let start = Instant::now();
+
+        // Spawn N child processes, each creating one loopback device.
+        let mut children: Vec<std::process::Child> = (0..n)
+            .map(|_| {
+                let name = next_name();
+                std::process::Command::new(&self_exe)
+                    .args(["--child", &name])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn child")
+            })
+            .collect();
+
+        // Wait for each child to print its creation time (one line of nanos).
+        let mut creation_times = Vec::new();
+        for child in &mut children {
+            let stdout = child.stdout.as_mut().unwrap();
+            let mut line = String::new();
+            use std::io::BufRead;
+            std::io::BufReader::new(stdout).read_line(&mut line).ok();
+            if let Ok(nanos) = line.trim().parse::<u64>() {
+                creation_times.push(Duration::from_nanos(nanos));
+            }
+        }
+
+        let wall = start.elapsed();
+
+        // Teardown: SIGTERM all children and wait
+        for child in &mut children {
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM); }
+        }
+        for child in &mut children {
+            let _ = child.wait();
+        }
+
+        if creation_times.len() == n {
+            let max_create = creation_times.iter().max().unwrap();
+            eprintln!("multiprocess_create/{n:<22}          wall={:>8.1}ms  per_device={:.1}ms  slowest_create={:.1}ms",
+                wall.as_secs_f64() * 1000.0,
+                wall.as_secs_f64() * 1000.0 / n as f64,
+                max_create.as_secs_f64() * 1000.0);
+        } else {
+            eprintln!("multiprocess_create/{n}: only {}/{n} children reported", creation_times.len());
+        }
+    }
+
+    // 5. Sustained sequential throughput (30 seconds)
     if !stop.load(Ordering::Relaxed) {
         eprintln!("sustained_sequential: running for 30s...");
         let deadline = Instant::now() + Duration::from_secs(30);
