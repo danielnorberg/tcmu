@@ -103,8 +103,14 @@ On a clean system with the `device_lifecycle` benchmark:
 
 | Operation | Latency |
 |-----------|---------|
-| create + destroy (no loopback) | ~10ms |
-| create + destroy (with loopback) | TBD (re-run on clean system) |
+| create + destroy (no loopback) | ~14ms |
+| create + destroy (with loopback, sequential) | ~170ms typical |
+| concurrent create 4 devices | 75ms wall (19ms/device) |
+| concurrent create 8 devices | 93ms wall (12ms/device) |
+
+Occasional outliers (~30s) occur when kernel SCSI teardown waits for
+command timeouts. Setting `cmd_time_out` to a short value (5s) limits
+the worst case.
 
 The loopback path is dominated by:
 - 50ms initial sleep in `LoopbackStarter::run()` (lets event loop start)
