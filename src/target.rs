@@ -139,11 +139,9 @@ impl TcmuTargetBuilder {
     /// this duration and the kernel completes them with CHECK CONDITION,
     /// allowing cleanup to proceed.
     ///
-    /// **Cannot be changed after LUN exports exist.** The kernel default is
-    /// 30 seconds. Setting this to a shorter value (e.g. 5-10s) improves
-    /// recovery time after handler crashes. Setting to zero disables
-    /// timeouts entirely — handler crashes become unrecoverable without
-    /// reboot.
+    /// **Cannot be changed after LUN exports exist.** Defaults to 10 seconds.
+    /// Setting to zero disables timeouts entirely — handler crashes become
+    /// unrecoverable without `reset_ring`.
     pub fn cmd_time_out(mut self, timeout: Duration) -> Self {
         self.cmd_time_out = Some(timeout);
         self
@@ -228,13 +226,12 @@ impl TcmuTarget {
             .context("writing hw_max_sectors to control")?;
         }
 
-        if let Some(timeout) = cfg.cmd_time_out {
-            fs::write(
-                device_configfs.join("control"),
-                format!("cmd_time_out={}", timeout.as_secs()),
-            )
-            .context("writing cmd_time_out to control")?;
-        }
+        let timeout = cfg.cmd_time_out.unwrap_or(Duration::from_secs(10));
+        fs::write(
+            device_configfs.join("control"),
+            format!("cmd_time_out={}", timeout.as_secs()),
+        )
+        .context("writing cmd_time_out to control")?;
 
         fs::write(device_configfs.join("enable"), "1").context("enabling device")?;
 
@@ -267,24 +264,15 @@ impl TcmuTarget {
         &self.uio_path
     }
 
-    /// Signal the event loop started by [`run`](Self::run) to return cleanly.
+    /// Gracefully shut down the target.
     ///
-    /// Safe to call from any thread. [`run`] will return `Ok(())` within 100 ms.
+    /// If a loopback fabric is active, it is torn down first while the event
+    /// loop is still running, so the kernel's SCSI teardown commands can be
+    /// serviced normally. Then the event loop is signaled to stop.
+    ///
+    /// Safe to call from any thread. After calling this, join the event loop
+    /// thread (if you spawned one) and then drop the target.
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
-    }
-
-    /// Tear down the loopback fabric while the event loop is still running,
-    /// then signal the event loop to stop.
-    ///
-    /// This is the preferred shutdown sequence: removing the LUN while the
-    /// handler is alive lets the kernel's SCSI teardown commands (INQUIRY,
-    /// TEST UNIT READY) be serviced normally, avoiding 30-second SCSI
-    /// command timeouts during device removal.
-    ///
-    /// After calling this, join the event loop thread and then drop the
-    /// target.
-    pub fn shutdown(&self) {
         if let Ok(mut loopback) = self.loopback.lock()
             && let Some(lb) = loopback.take()
         {

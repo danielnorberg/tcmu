@@ -151,7 +151,6 @@ impl BenchEnv {
                 .name(&target_name)
                 .size_bytes(size)
                 .hw_max_sectors(8192) // 4 MiB (default 128 = 64 KiB)
-                .cmd_time_out(Duration::from_secs(10))
                 .with_loopback()
                 .build()?,
         );

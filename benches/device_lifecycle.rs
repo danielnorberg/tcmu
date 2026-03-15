@@ -105,7 +105,7 @@ fn create_one_loopback(
 }
 
 fn teardown(target: Arc<TcmuTarget>, handle: std::thread::JoinHandle<anyhow::Result<()>>) {
-    target.shutdown();
+    target.stop();
     let _ = handle.join();
 }
 

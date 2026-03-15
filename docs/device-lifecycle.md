@@ -62,40 +62,19 @@ reboot.
 
 ## Prevention
 
-### Set `cmd_time_out` before export
+### `cmd_time_out`
 
-The `cmd_time_out` attribute **cannot be changed after LUN exports exist**.
-It must be written to the `control` file before creating any loopback LUNs:
-
-```
-echo "cmd_time_out=10" > /sys/kernel/config/target/core/user_0/<device>/control
-```
-
-Or via the builder:
-
-```rust
-TcmuTarget::builder()
-    .name("mydev")
-    .size_bytes(size)
-    .cmd_time_out(Duration::from_secs(10))
-    .with_loopback()
-    .build()?;
-```
-
-A short timeout (5-10s) ensures that handler crashes are recoverable within
-seconds rather than the default 30s.
-
-### Use `reset_ring` in Drop
-
-If the event loop thread has died or is unresponsive, `Drop` should write to
-`action/reset_ring` before attempting LUN unlink. This force-completes all
-in-flight commands and allows cleanup to proceed.
+The library defaults `cmd_time_out` to 10 seconds (the kernel default is 30s).
+This ensures handler crashes are recoverable within 10s. Override with
+`.cmd_time_out(Duration::from_secs(N))` if needed. Setting to zero disables
+timeouts — **do not do this in production**.
 
 ### Graceful shutdown
 
-Always call `target.stop()` and join the event loop thread before dropping.
-If the thread panicked or the process is shutting down, `reset_ring` is the
-fallback.
+Call `target.stop()` before dropping. This tears down the loopback fabric
+while the event loop is still running (so SCSI teardown commands are serviced),
+then signals the event loop to exit. `Drop` handles `reset_ring` and configfs
+cleanup as a fallback if `stop()` was not called (e.g. handler crash).
 
 ## Benchmark Findings
 
