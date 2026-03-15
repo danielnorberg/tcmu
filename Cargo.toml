@@ -24,3 +24,8 @@ tempfile = "3"
 name = "file_read"
 harness = false
 required-features = ["linux-target"]
+
+[[bench]]
+name = "device_lifecycle"
+harness = false
+required-features = ["linux-target"]
