@@ -67,6 +67,7 @@ pub struct TcmuTargetBuilder {
     wwn: Option<String>,
     read_ahead_kb: Option<u32>,
     hw_max_sectors: Option<u32>,
+    cmd_time_out: Option<Duration>,
 }
 
 impl TcmuTargetBuilder {
@@ -128,6 +129,23 @@ impl TcmuTargetBuilder {
     /// (`max_data_area_mb`, default 1024 MiB).
     pub fn hw_max_sectors(mut self, sectors: u32) -> Self {
         self.hw_max_sectors = Some(sectors);
+        self
+    }
+
+    /// SCSI command timeout for the TCMU device.
+    ///
+    /// Written to the `control` file before the device is enabled. When a
+    /// handler crashes (UIO fd closes), in-flight commands time out after
+    /// this duration and the kernel completes them with CHECK CONDITION,
+    /// allowing cleanup to proceed.
+    ///
+    /// **Cannot be changed after LUN exports exist.** The kernel default is
+    /// 30 seconds. Setting this to a shorter value (e.g. 5-10s) improves
+    /// recovery time after handler crashes. Setting to zero disables
+    /// timeouts entirely — handler crashes become unrecoverable without
+    /// reboot.
+    pub fn cmd_time_out(mut self, timeout: Duration) -> Self {
+        self.cmd_time_out = Some(timeout);
         self
     }
 
@@ -207,6 +225,14 @@ impl TcmuTarget {
             .context("writing hw_max_sectors to control")?;
         }
 
+        if let Some(timeout) = cfg.cmd_time_out {
+            fs::write(
+                device_configfs.join("control"),
+                format!("cmd_time_out={}", timeout.as_secs()),
+            )
+            .context("writing cmd_time_out to control")?;
+        }
+
         fs::write(device_configfs.join("enable"), "1").context("enabling device")?;
 
         // 2. Find the UIO device the kernel created (appears under /sys/class/uio/).
@@ -267,6 +293,16 @@ impl TcmuTarget {
 impl Drop for TcmuTarget {
     fn drop(&mut self) {
         // Best-effort — ignore individual errors so drop never panics.
+
+        // Force-complete any in-flight commands so that LUN teardown does not
+        // block on lun_ref draining. This is critical when the event loop has
+        // already exited (handler crash or normal shutdown) — without it, the
+        // kernel waits for SCSI commands that will never be completed.
+        let _ = fs::write(
+            self.device_configfs.join("action").join("reset_ring"),
+            "2",
+        );
+
         if let Ok(loopback) = self.loopback.lock()
             && let Some(lb) = loopback.as_ref()
         {

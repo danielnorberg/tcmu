@@ -115,6 +115,7 @@ fn main() -> anyhow::Result<()> {
     let target = TcmuTarget::builder()
         .name("loopback")
         .size_bytes(size)
+        .cmd_time_out(std::time::Duration::from_secs(10))
         .with_loopback()
         .build()?;
 

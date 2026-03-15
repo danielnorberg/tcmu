@@ -92,6 +92,7 @@ fn create_one_loopback(
         TcmuTarget::builder()
             .name(name)
             .size_bytes(DEVICE_SIZE)
+            .cmd_time_out(Duration::from_secs(5))
             .with_loopback()
             .build()?,
     );
@@ -131,12 +132,10 @@ fn bench_create_destroy(c: &mut Criterion) {
         return;
     }
 
-    let mut group = c.benchmark_group("create_destroy");
-    group.sample_size(20);
-    group.sampling_mode(SamplingMode::Flat);
-
-    // No loopback — configfs + UIO wait + teardown only
-    group.bench_function("no_loopback", |b| {
+    let mut no_lb = c.benchmark_group("create_destroy");
+    no_lb.sample_size(20);
+    no_lb.sampling_mode(SamplingMode::Flat);
+    no_lb.bench_function("no_loopback", |b| {
         b.iter_custom(|iters| {
             let mut elapsed = Duration::ZERO;
             for _ in 0..iters {
@@ -153,11 +152,15 @@ fn bench_create_destroy(c: &mut Criterion) {
             elapsed
         });
     });
+    no_lb.finish();
 
     // With loopback — full lifecycle: build + event loop + block device appearance + teardown.
     // Each iteration waits for the previous device to fully disappear before starting,
     // ensuring we measure one clean device lifecycle at a time.
-    group.bench_function("with_loopback", |b| {
+    let mut with_lb = c.benchmark_group("create_destroy_loopback");
+    with_lb.sample_size(10);
+    with_lb.sampling_mode(SamplingMode::Flat);
+    with_lb.bench_function("sequential", |b| {
         b.iter_custom(|iters| {
             let mut elapsed = Duration::ZERO;
             for _ in 0..iters {
@@ -175,8 +178,7 @@ fn bench_create_destroy(c: &mut Criterion) {
             elapsed
         });
     });
-
-    group.finish();
+    with_lb.finish();
 }
 
 fn bench_concurrent_create(c: &mut Criterion) {
