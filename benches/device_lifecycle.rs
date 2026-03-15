@@ -147,6 +147,11 @@ fn run_child(name: &str) {
     teardown(target, handle);
 }
 
+fn send_sigterm(child: &std::process::Child) {
+    // Safety: sending a signal to a known child process we spawned.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+}
+
 fn main() {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("must run as root");
@@ -169,6 +174,46 @@ fn main() {
         .expect("register SIGTERM");
 
     let self_exe = std::env::current_exe().expect("current_exe");
+
+    // Parse --steady-state N: create N background devices before benchmarking.
+    let steady_state_n: usize = args.windows(2)
+        .find(|w| w[0] == "--steady-state")
+        .and_then(|w| w[1].parse().ok())
+        .unwrap_or(0);
+
+    // Create steady-state background devices using child processes.
+    let mut bg_children: Vec<std::process::Child> = Vec::new();
+    if steady_state_n > 0 {
+        eprintln!("creating {steady_state_n} steady-state devices...");
+        let batch = 64;
+        let mut created = 0;
+        while created < steady_state_n && !stop.load(Ordering::Relaxed) {
+            let n = batch.min(steady_state_n - created);
+            let children: Vec<_> = (0..n)
+                .map(|_| {
+                    let name = next_name();
+                    std::process::Command::new(&self_exe)
+                        .args(["--child", &name])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .expect("spawn child")
+                })
+                .collect();
+            // Wait for each child to report it's ready (one line on stdout).
+            for mut child in children {
+                let stdout = child.stdout.as_mut().unwrap();
+                let mut line = String::new();
+                use std::io::BufRead;
+                let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+                bg_children.push(child);
+            }
+            created += n;
+            eprintln!("  {created}/{steady_state_n} devices ready");
+        }
+        eprintln!("steady state: {} devices running", bg_children.len());
+        eprintln!();
+    }
 
     eprintln!();
 
@@ -293,7 +338,7 @@ fn main() {
 
         // Teardown: SIGTERM all children and wait
         for child in &mut children {
-            unsafe { libc::kill(child.id() as i32, libc::SIGTERM); }
+            send_sigterm(child);
         }
         for child in &mut children {
             let _ = child.wait();
@@ -335,6 +380,18 @@ fn main() {
         let rate = count as f64 / elapsed.as_secs_f64();
         eprintln!("sustained_sequential                     count={count}  elapsed={:.1}s  rate={rate:.1}/s",
             elapsed.as_secs_f64());
+    }
+
+    // Teardown steady-state background devices.
+    if !bg_children.is_empty() {
+        eprintln!("tearing down {} steady-state devices...", bg_children.len());
+        for child in &mut bg_children {
+            send_sigterm(child);
+        }
+        for child in &mut bg_children {
+            let _ = child.wait();
+        }
+        eprintln!("steady-state teardown complete");
     }
 
     eprintln!();
