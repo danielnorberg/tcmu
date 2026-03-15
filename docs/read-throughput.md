@@ -128,5 +128,5 @@ tcmu::target::set_read_ahead_kb(&block_dev, 8192)?;
 cargo test --features linux-target
 cargo clippy --all-targets --all-features -- -D warnings
 cargo bench --features linux-target --bench file_read --no-run
-sudo target/release/deps/file_read-* --bench --noplot
+sudo $(ls target/release/deps/file_read-* | grep -v '\\.') --bench --noplot
 ```

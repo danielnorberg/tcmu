@@ -156,7 +156,7 @@ setup):
 
 ```sh
 cargo bench --features linux-target --bench file_read --no-run
-sudo target/release/deps/file_read-* --bench --noplot
+sudo $(ls target/release/deps/file_read-* | grep -v '\\.') --bench --noplot
 ```
 
 The benchmark prepares one ext4 image, populates it once, keeps the backing
