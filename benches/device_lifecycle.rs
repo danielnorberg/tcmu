@@ -108,6 +108,7 @@ fn main() {
 
     // 1. No loopback
     {
+        eprintln!("[no_loopback] building...");
         let name = next_name();
         let start = Instant::now();
         let target = TcmuTarget::builder()
@@ -115,24 +116,29 @@ fn main() {
             .size_bytes(DEVICE_SIZE)
             .build()
             .expect("build failed");
+        eprintln!("[no_loopback] built in {:.1}ms, dropping...", start.elapsed().as_secs_f64() * 1000.0);
         drop(target);
         println!("create_destroy/no_loopback          {:>8.1}ms", start.elapsed().as_secs_f64() * 1000.0);
     }
 
     // 2. With loopback (sequential)
     {
+        eprintln!("[loopback] building...");
         let name = next_name();
         let before = tcm_loop_block_devices();
         let start = Instant::now();
         let (target, handle, dev) = create_one_loopback(&name, &before).expect("create failed");
         let created = start.elapsed();
+        eprintln!("[loopback] created in {:.1}ms, tearing down...", created.as_secs_f64() * 1000.0);
         teardown(target, handle);
         let total = start.elapsed();
+        eprintln!("[loopback] torn down in {:.1}ms total, waiting for removal...", total.as_secs_f64() * 1000.0);
         println!("create_destroy/loopback             {:>8.1}ms  (create {:>8.1}ms  teardown {:>8.1}ms)",
             total.as_secs_f64() * 1000.0,
             created.as_secs_f64() * 1000.0,
             (total - created).as_secs_f64() * 1000.0);
         wait_for_device_removal(&dev, Duration::from_secs(5));
+        eprintln!("[loopback] done");
     }
 
     // 3. Concurrent (4 devices)
