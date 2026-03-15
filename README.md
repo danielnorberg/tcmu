@@ -136,7 +136,8 @@ See the [`examples/`](examples/) directory:
 
 - [`loopback.rs`](examples/loopback.rs) — serves a filesystem image file as a mountable kernel block device using `TcmuTarget`. Requires the `linux-target` feature and root on Linux.
   ```sh
-  sudo cargo run --example loopback --features linux-target -- /tmp/ext4.img
+  cargo build --example loopback --features linux-target
+  sudo target/debug/examples/loopback /tmp/ext4.img
   ```
 
 ## Benchmarks
@@ -150,10 +151,12 @@ It benchmarks two workloads:
 - Reading a 4 GiB large file (`large_file/{tcmu,loop}`)
 - Reading many small files (`small_files/{tcmu,loop}`)
 
-Run it on Linux as root with the `linux-target` feature enabled:
+Build, then run the binary as root (since TCMU requires configfs and device
+setup):
 
 ```sh
-sudo cargo bench --features linux-target --bench file_read -- --noplot
+cargo bench --features linux-target --bench file_read --no-run
+sudo target/release/deps/file_read-* --bench --noplot
 ```
 
 The benchmark prepares one ext4 image, populates it once, keeps the backing
