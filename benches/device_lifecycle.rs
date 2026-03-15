@@ -175,16 +175,12 @@ fn main() {
         return;
     }
 
-    // Clean up all TCMU devices (use with care — removes everything).
+    // Clean up all TCMU devices and orphaned loopbacks.
     if args.get(1).is_some_and(|a| a == "--cleanup") {
-        let devices = tcmu::target::list_devices();
-        if devices.is_empty() {
-            eprintln!("no devices found");
-        }
-        for dev in &devices {
-            eprintln!("cleaning up: {}", dev.name);
-            tcmu::target::cleanup_device(dev);
-        }
+        tcmu::target::cleanup_stale(|name| {
+            eprintln!("cleaning up: {name}");
+            true
+        });
         return;
     }
 

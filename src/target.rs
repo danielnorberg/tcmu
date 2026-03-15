@@ -531,38 +531,113 @@ pub fn list_devices() -> Vec<TcmuDeviceInfo> {
     devices
 }
 
-/// Clean up an orphaned TCMU device and its loopback fabric.
+/// Clean up a TCMU device by name.
 ///
-/// Performs `reset_ring` to force-complete stuck commands, deletes the SCSI
-/// device, removes the loopback fabric, and removes the configfs device
-/// directory.
+/// Performs the full cleanup sequence: `reset_ring`, SCSI device deletion,
+/// loopback fabric removal, and configfs device removal. Handles all
+/// intermediate states — safe to call whether the device was fully set up,
+/// partially created, or already partially cleaned.
 ///
-/// **Idempotent**: safe to call multiple times on the same device, and safe
-/// to call even if a previous cleanup was interrupted partway through.
-pub fn cleanup_device(info: &TcmuDeviceInfo) {
-    let dev = &info.configfs_path;
+/// **Idempotent**: safe to call multiple times and safe to call if a
+/// previous cleanup was interrupted at any step.
+pub fn cleanup_device(name: &str, hba_index: u32) {
+    let dev = PathBuf::from(CONFIGFS)
+        .join("core")
+        .join(format!("user_{hba_index}"))
+        .join(name);
 
     // 1. Force-complete all in-flight commands.
     let _ = fs::write(dev.join("action").join("reset_ring"), "2");
 
-    // 2. Clean up loopback fabric if it exists.
-    cleanup_loopback_for_name(&info.name);
+    // 2. Clean up loopback fabric.
+    cleanup_loopback(name);
 
     // 3. Remove the TCMU device.
-    let _ = fs::remove_dir(dev);
+    let _ = fs::remove_dir(&dev);
+}
+
+/// Clean up all TCMU devices and orphaned loopback fabrics matching a
+/// name filter.
+///
+/// This is the single reconciliation entry point. It:
+/// 1. Enumerates all TCMU devices and cleans up matching ones
+/// 2. Scans for orphaned loopback fabrics (whose TCMU device was already
+///    removed by an interrupted cleanup) and cleans those up too
+///
+/// **Idempotent**: safe to call repeatedly.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn reconcile(expected: &std::collections::HashSet<String>) {
+/// // Clean up all devices with names starting with "myapp-"
+/// // that are not in the expected set.
+/// tcmu::target::cleanup_stale(|name| {
+///     name.starts_with("myapp-") && !expected.contains(name)
+/// });
+/// # }
+/// ```
+pub fn cleanup_stale(should_remove: impl Fn(&str) -> bool) {
+    // Pass 1: TCMU devices in configfs.
+    for dev in list_devices() {
+        if should_remove(&dev.name) {
+            cleanup_device(&dev.name, dev.hba_index);
+        }
+    }
+
+    // Pass 2: orphaned loopback fabrics whose TCMU device is already gone.
+    let loopback_dir = PathBuf::from(CONFIGFS).join("loopback");
+    let Ok(rd) = fs::read_dir(&loopback_dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let wwn = entry.file_name().to_string_lossy().to_string();
+        if !wwn.starts_with("naa.") {
+            continue;
+        }
+        let tpgt_dir = entry.path().join("tpgt_1");
+        let lun_dir = tpgt_dir.join("lun").join("lun_0");
+
+        // Find the device name from the LUN symlink.
+        let device_name = fs::read_dir(&lun_dir).ok().and_then(|rd| {
+            rd.flatten().find_map(|e| {
+                e.file_type()
+                    .ok()
+                    .and_then(|ft| ft.is_symlink().then(|| {
+                        e.file_name().to_string_lossy().to_string()
+                    }))
+            })
+        });
+
+        let should_clean = match &device_name {
+            Some(name) => should_remove(name),
+            None => true, // no LUN symlink — half-created, always clean up
+        };
+
+        if should_clean {
+            cleanup_loopback(device_name.as_deref().unwrap_or(""));
+            // Also try removing the bare wwn dir in case cleanup_loopback
+            // couldn't (e.g. no LUN symlink to derive the name from).
+            let _ = fs::remove_dir(&lun_dir);
+            let _ = fs::remove_dir(&tpgt_dir);
+            let _ = fs::remove_dir(entry.path());
+        }
+    }
 }
 
 /// Clean up a loopback fabric by device name.
 ///
 /// Uses the deterministic WWN derived from the device name to find the
 /// loopback directory. Idempotent — no-op if the fabric doesn't exist.
-fn cleanup_loopback_for_name(name: &str) {
+fn cleanup_loopback(name: &str) {
+    if name.is_empty() {
+        return;
+    }
     let wwn = derive_wwn(name);
     let wwn_dir = PathBuf::from(CONFIGFS).join("loopback").join(&wwn);
     let tpgt_dir = wwn_dir.join("tpgt_1");
 
     if !tpgt_dir.exists() {
-        // No tpgt — maybe just the wwn dir is left over.
         let _ = fs::remove_dir(&wwn_dir);
         return;
     }
@@ -585,67 +660,6 @@ fn cleanup_loopback_for_name(name: &str) {
     let _ = fs::remove_dir(&lun_dir);
     let _ = fs::remove_dir(&tpgt_dir);
     let _ = fs::remove_dir(&wwn_dir);
-}
-
-/// Clean up loopback fabrics that have no corresponding TCMU device.
-///
-/// This catches the case where `cleanup_device` was interrupted after
-/// removing the configfs device directory (step 3) but before finishing
-/// the loopback removal (step 2). Such fabrics are invisible to
-/// [`list_devices`] since the configfs device is already gone.
-///
-/// `name_filter` is called with each loopback's device name (derived from
-/// the LUN symlink target). Return `true` to clean it up.
-pub fn cleanup_orphaned_loopbacks(name_filter: impl Fn(&str) -> bool) {
-    let loopback_dir = PathBuf::from(CONFIGFS).join("loopback");
-    let Ok(rd) = fs::read_dir(&loopback_dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let wwn = entry.file_name().to_string_lossy().to_string();
-        if !wwn.starts_with("naa.") {
-            continue;
-        }
-        let tpgt_dir = entry.path().join("tpgt_1");
-        let lun_dir = tpgt_dir.join("lun").join("lun_0");
-
-        // Find the device name from the LUN symlink target.
-        let device_name = fs::read_dir(&lun_dir)
-            .ok()
-            .and_then(|rd| {
-                rd.flatten().find_map(|e| {
-                    e.file_type().ok().and_then(|ft| {
-                        ft.is_symlink().then(|| e.file_name().to_string_lossy().to_string())
-                    })
-                })
-            });
-
-        let should_clean = match &device_name {
-            Some(name) => {
-                // Check if the TCMU device still exists in configfs.
-                // If not, this loopback is definitely orphaned.
-                let device_exists = PathBuf::from(CONFIGFS)
-                    .join("core")
-                    .join("user_0")
-                    .join(name)
-                    .exists();
-                !device_exists && name_filter(name)
-            }
-            // No LUN symlink — half-created or half-cleaned, remove it.
-            None => true,
-        };
-
-        if should_clean {
-            if let Some(name) = &device_name {
-                cleanup_loopback_for_name(name);
-            } else {
-                // No LUN link, just remove dirs.
-                let _ = fs::remove_dir(&lun_dir);
-                let _ = fs::remove_dir(&tpgt_dir);
-                let _ = fs::remove_dir(entry.path());
-            }
-        }
-    }
 }
 
 
