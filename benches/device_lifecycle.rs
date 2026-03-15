@@ -167,25 +167,22 @@ fn main() {
         return;
     }
 
-    // List all TCMU devices and their handler status.
+    // List all TCMU devices.
     if args.get(1).is_some_and(|a| a == "--list") {
         for dev in tcmu::target::list_devices() {
-            eprintln!("  {} (hba={}) handler={:?}",
-                dev.name, dev.hba_index,
-                dev.handler_pid.map(|p| p.to_string()).unwrap_or_else(|| "NONE".into()));
+            eprintln!("  {} (hba={})", dev.name, dev.hba_index);
         }
         return;
     }
 
-    // Clean up all orphaned devices (no handler PID).
+    // Clean up all TCMU devices (use with care — removes everything).
     if args.get(1).is_some_and(|a| a == "--cleanup") {
         let devices = tcmu::target::list_devices();
-        let orphans: Vec<_> = devices.iter().filter(|d| d.handler_pid.is_none()).collect();
-        if orphans.is_empty() {
-            eprintln!("no orphaned devices");
+        if devices.is_empty() {
+            eprintln!("no devices found");
         }
-        for dev in &orphans {
-            eprintln!("cleaning up orphan: {}", dev.name);
+        for dev in &devices {
+            eprintln!("cleaning up: {}", dev.name);
             tcmu::target::cleanup_device(dev);
         }
         return;

@@ -487,20 +487,18 @@ pub struct TcmuDeviceInfo {
     pub name: String,
     /// HBA index (the `N` in `user_N`).
     pub hba_index: u32,
-    /// PID of the process that has the UIO fd open, if any.
-    /// `None` means no handler is running — the device is orphaned.
-    pub handler_pid: Option<u32>,
     /// The configfs device directory path.
     pub configfs_path: PathBuf,
 }
 
-/// Enumerate all TCMU devices on the system.
+/// Enumerate all TCMU devices registered in configfs.
 ///
-/// Scans configfs for devices under `user_0`, `user_1`, etc. and checks
-/// whether each device has an active handler (UIO fd open by a process).
+/// Returns one entry per device under `user_0`, `user_1`, etc. The caller
+/// is responsible for determining which devices are orphans — typically by
+/// comparing device names against an expected set or checking whether the
+/// child process that created each device is still alive.
 ///
-/// Useful for reconciliation: compare the returned list against your
-/// expected set of devices, and call [`cleanup_device`] on any orphans.
+/// Call [`cleanup_device`] on any devices that should be removed.
 pub fn list_devices() -> Vec<TcmuDeviceInfo> {
     let mut devices = Vec::new();
     let core_dir = PathBuf::from(CONFIGFS).join("core");
@@ -523,11 +521,9 @@ pub fn list_devices() -> Vec<TcmuDeviceInfo> {
             if name == "hba_info" || name == "hba_mode" {
                 continue;
             }
-            let handler_pid = find_handler_pid(hba_index, &name);
             devices.push(TcmuDeviceInfo {
                 name,
                 hba_index,
-                handler_pid,
                 configfs_path: dev_entry.path(),
             });
         }
@@ -583,47 +579,6 @@ pub fn cleanup_device(info: &TcmuDeviceInfo) {
     let _ = fs::remove_dir(dev);
 }
 
-/// Find the PID of the process holding the UIO fd for a TCMU device.
-fn find_handler_pid(hba_index: u32, name: &str) -> Option<u32> {
-    let expected = format!("tcm-user/{hba_index}/{name}");
-    let Ok(rd) = fs::read_dir("/sys/class/uio") else {
-        return None;
-    };
-    for entry in rd.flatten() {
-        if let Ok(uio_name) = fs::read_to_string(entry.path().join("name"))
-            && uio_name.trim() == expected
-        {
-            // Found the UIO device. Check who has it open via /dev/uioN.
-            let uio_dev = PathBuf::from("/dev").join(entry.file_name());
-            return find_pid_with_fd_open(&uio_dev);
-        }
-    }
-    None
-}
-
-/// Find a PID that has the given path open as a file descriptor.
-fn find_pid_with_fd_open(path: &Path) -> Option<u32> {
-    let Ok(rd) = fs::read_dir("/proc") else {
-        return None;
-    };
-    for entry in rd.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let fd_dir = entry.path().join("fd");
-        let Ok(fds) = fs::read_dir(&fd_dir) else {
-            continue;
-        };
-        for fd_entry in fds.flatten() {
-            if let Ok(target) = fs::read_link(fd_entry.path())
-                && target == path
-            {
-                return Some(pid);
-            }
-        }
-    }
-    None
-}
 
 // ─── UIO event loop ───────────────────────────────────────────────────────────
 //
